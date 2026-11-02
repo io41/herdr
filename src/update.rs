@@ -30,6 +30,7 @@ const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
+const DISABLE_UPDATES_ENV: &str = "HERDR_DISABLE_UPDATES";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";
 const DEFAULT_FAKE_UPDATE_NOTES_VERSION: &str = "0.3.0";
@@ -41,6 +42,24 @@ const SERVER_HANDOFF_REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
 const SERVER_HANDOFF_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(windows))]
 const SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn update_disabled_reason(channel: &str, disabled_env: Option<&str>) -> Option<&'static str> {
+    if channel == "inbox" {
+        Some("self-update is disabled for inbox builds; rebuild this fork to update it")
+    } else if matches!(disabled_env, Some("1" | "true")) {
+        Some("self-update is disabled by HERDR_DISABLE_UPDATES; unset it to enable updates")
+    } else {
+        None
+    }
+}
+
+fn current_update_disabled_reason() -> Option<&'static str> {
+    update_disabled_reason(
+        crate::build_info::channel(),
+        env::var(DISABLE_UPDATES_ENV).ok().as_deref(),
+    )
+}
+
 fn fake_release_notes_body(version: &str) -> String {
     let notes_version = env::var(FAKE_UPDATE_NOTES_VERSION_ENV)
         .ok()
@@ -2181,6 +2200,10 @@ fn preserve_preview_channel_for_install(
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    if let Some(reason) = current_update_disabled_reason() {
+        return Err(reason.into());
+    }
+
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2425,6 +2448,10 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
 /// Background update check: only surface availability and release notes.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    if current_update_disabled_reason().is_some() {
+        return;
+    }
+
     crate::logging::update_check_started();
     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
         let version = version.trim();
@@ -2582,6 +2609,55 @@ fn platform_target() -> (&'static str, &'static str) {
 #[cfg(test)]
 mod channel_tests {
     use super::*;
+
+    #[test]
+    fn update_lock_preserves_inbox_builds_and_respects_explicit_opt_out() {
+        for disabled_env in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("1"),
+            Some("true"),
+        ] {
+            assert_eq!(
+                update_disabled_reason("inbox", disabled_env),
+                Some("self-update is disabled for inbox builds; rebuild this fork to update it")
+            );
+        }
+
+        for channel in ["stable", "preview"] {
+            for disabled_env in [Some("1"), Some("true")] {
+                assert_eq!(
+                    update_disabled_reason(channel, disabled_env),
+                    Some("self-update is disabled by HERDR_DISABLE_UPDATES; unset it to enable updates")
+                );
+            }
+            for disabled_env in [None, Some(""), Some("0"), Some("false")] {
+                assert_eq!(update_disabled_reason(channel, disabled_env), None);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_update_entrypoints_refuse_without_sending_events() {
+        let Some(reason) = current_update_disabled_reason() else {
+            return;
+        };
+
+        for live_handoff in [false, true] {
+            assert_eq!(
+                self_update(SelfUpdateOptions { live_handoff }).unwrap_err(),
+                reason
+            );
+        }
+        let (events, mut receiver) = tokio::sync::mpsc::channel(1);
+        auto_update(events);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
 
     fn manifests() -> (UpdateManifest, PreviewManifest) {
         let (os, arch) = platform_target();
