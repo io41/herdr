@@ -104,6 +104,14 @@ impl WorkspaceGitStatusSnapshot {
 static NEXT_WORKSPACE_ID: AtomicU64 = AtomicU64::new(1);
 const PUBLIC_ID_ALPHABET: &[u8; 32] = b"123456789ABCDEFGHJKMNPQRSTVWXYZ0";
 
+pub(crate) fn generate_location_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let entropy = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!("location_{}_{entropy:016x}", TerminalId::alloc())
+}
+
 pub(crate) fn generate_workspace_id() -> String {
     let counter = NEXT_WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
     format!("w{}", encode_public_number(counter as usize))
@@ -176,6 +184,8 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
     pub id: String,
+    /// Durable location identity, independent of reusable public workspace IDs.
+    pub location_id: String,
     /// User-provided override. If set, auto-derived identity stops updating.
     pub custom_name: Option<String>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
@@ -251,6 +261,7 @@ impl Workspace {
             discover_workspace_git_identity(&identity_cwd);
         Self {
             id,
+            location_id: generate_location_id(),
             custom_name: label,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
@@ -345,7 +356,7 @@ impl Workspace {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn new_with_tab(
+    pub(crate) fn new_with_tab(
         initial_cwd: PathBuf,
         rows: u16,
         cols: u16,
@@ -403,6 +414,7 @@ impl Workspace {
         Ok((
             Self {
                 id,
+                location_id: generate_location_id(),
                 custom_name: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
@@ -1177,6 +1189,7 @@ impl Workspace {
         let mut panes = HashMap::new();
         panes.insert(root_id, PaneState::new(terminal_id));
         let tab = Tab {
+            location_id: generate_location_id(),
             custom_name: None,
             number: 1,
             root_pane: root_id,
@@ -1192,6 +1205,7 @@ impl Workspace {
         public_pane_numbers.insert(tab.root_pane, 1);
         Self {
             id: generate_workspace_id(),
+            location_id: generate_location_id(),
             custom_name: Some(name.to_string()),
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
@@ -1233,6 +1247,7 @@ impl Workspace {
         let mut panes = HashMap::new();
         panes.insert(root_id, PaneState::new(TerminalId::alloc()));
         let tab = Tab {
+            location_id: generate_location_id(),
             custom_name: name.map(str::to_string),
             number: self.next_public_tab_number,
             root_pane: root_id,

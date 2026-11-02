@@ -104,6 +104,19 @@ pub enum ResponseResult {
     AgentPrompted {
         agent: AgentInfo,
     },
+    AgentConversations {
+        projection: serde_json::Value,
+    },
+    AgentConversation {
+        conversation: serde_json::Value,
+    },
+    AgentConversationOpened {
+        conversation_id: String,
+        pane_id: String,
+    },
+    AgentConversationResume {
+        result: serde_json::Value,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

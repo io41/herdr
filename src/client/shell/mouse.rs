@@ -1391,6 +1391,14 @@ impl ClientShellState {
                 .find(|(rect, _)| super::contains(*rect, point))
                 .copied();
             match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.move_global_menu_selection(-1);
+                    outcome.repaint = true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.move_global_menu_selection(1);
+                    outcome.repaint = true;
+                }
                 MouseEventKind::Moved => {
                     if let (Some((_, index)), Some(ClientShellOverlay::GlobalMenu(menu))) =
                         (row_hit, self.overlay.as_mut())
@@ -1422,6 +1430,14 @@ impl ClientShellState {
                 .find(|(rect, _)| super::contains(*rect, point))
                 .copied();
             match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.move_context_menu_selection(-1);
+                    outcome.repaint = true;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.move_context_menu_selection(1);
+                    outcome.repaint = true;
+                }
                 MouseEventKind::Moved => {
                     if let (Some((_, index)), Some(ClientShellOverlay::ContextMenu(menu))) =
                         (row_hit, self.overlay.as_mut())
@@ -1783,6 +1799,9 @@ impl ClientShellState {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Right) => {
+                if self.handle_conversation_click(point, true, outcome) {
+                    return;
+                }
                 let pane_hit = self
                     .hits
                     .panes
@@ -2020,6 +2039,9 @@ impl ClientShellState {
                             }
                         }
                     }
+                    return;
+                }
+                if self.handle_conversation_click(point, false, outcome) {
                     return;
                 }
                 if super::contains(self.hits.agent_sort_toggle, point) {

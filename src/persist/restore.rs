@@ -384,6 +384,9 @@ fn restore_workspace(
         if let Some(public_tab_number) = snap.public_tab_numbers.get(idx).copied() {
             tab.number = public_tab_number;
         }
+        if let Some(location_id) = snap.tab_location_ids.get(idx).filter(|id| !id.is_empty()) {
+            tab.location_id = location_id.clone();
+        }
         next_public_tab_number = next_public_tab_number.max(tab.number + 1);
         for pane_id in tab.layout.pane_ids() {
             let public_number = public_pane_numbers_by_old_raw
@@ -414,6 +417,11 @@ fn restore_workspace(
     (
         Some(Workspace {
             id: workspace_id,
+            location_id: snap
+                .location_id
+                .clone()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(crate::workspace::generate_location_id),
             custom_name: snap.custom_name.clone(),
             identity_cwd: snap.identity_cwd.clone(),
             cached_identity_cwd: snap.identity_cwd.clone(),
@@ -790,6 +798,7 @@ fn restore_tab(
     (
         Some((
             crate::workspace::Tab {
+                location_id: crate::workspace::generate_location_id(),
                 custom_name: snap.custom_name.clone(),
                 number,
                 root_pane,
@@ -1528,6 +1537,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                location_id: None,
+                tab_location_ids: Vec::new(),
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1609,6 +1620,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                location_id: None,
+                tab_location_ids: Vec::new(),
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1722,6 +1735,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                location_id: None,
+                tab_location_ids: Vec::new(),
                 id: Some("w1".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1805,6 +1820,8 @@ mod tests {
     fn legacy_restore_precomputes_missing_public_pane_numbers() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = WorkspaceSnapshot {
+            location_id: None,
+            tab_location_ids: Vec::new(),
             id: Some("w1".into()),
             custom_name: None,
             identity_cwd: cwd,
@@ -1844,6 +1861,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                location_id: None,
+                tab_location_ids: Vec::new(),
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -2200,6 +2219,8 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                location_id: None,
+                tab_location_ids: Vec::new(),
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd,

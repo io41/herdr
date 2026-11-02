@@ -11,6 +11,14 @@ use super::*;
 
 const MOBILE_BUTTON_WIDTH: u16 = 10;
 
+#[derive(Clone, Copy)]
+pub(super) struct MobileInbox<'a> {
+    pub(super) rows: &'a [super::agent_inbox::ConversationRow],
+    pub(super) expanded: [bool; 3],
+    pub(super) selected: Option<&'a (ClientEndpointId, String)>,
+    pub(super) read: &'a HashMap<String, u64>,
+}
+
 struct MobileItem {
     lines: Vec<Line<'static>>,
     background: Color,
@@ -367,6 +375,7 @@ pub(super) fn render_mobile_switcher(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    inbox: Option<MobileInbox<'_>>,
     selected_workspace_id: Option<&WorkspaceNavigationTarget>,
     scroll: &mut usize,
     reveal_workspace: &mut bool,
@@ -441,6 +450,7 @@ pub(super) fn render_mobile_switcher(
         endpoints,
         active_endpoint_id,
         config,
+        inbox,
         selected_workspace_id,
         viewport.width.saturating_sub(1),
     );
@@ -577,6 +587,7 @@ fn mobile_items(
     endpoints: &[ClientShellEndpoint],
     active_endpoint_id: &ClientEndpointId,
     config: &ClientShellConfig,
+    inbox: Option<MobileInbox<'_>>,
     selected_workspace_id: Option<&WorkspaceNavigationTarget>,
     content_width: u16,
 ) -> Vec<MobileItem> {
@@ -610,140 +621,144 @@ fn mobile_items(
             });
         }
     }
-    let agents = super::aggregate_navigation::aggregate_agent_rows(
-        endpoints,
-        active_endpoint_id,
-        config.agent_panel_sort,
-    );
-    let agent_view_label = snapshot.agent_view_label.as_deref();
-    if !agents.is_empty() || agent_view_label.is_some() {
-        let title = agent_view_label
-            .map(|label| format!("agents · {label}"))
-            .unwrap_or_else(|| "agents".to_owned());
-        items.push(MobileItem::section(title, palette));
-        if agents.is_empty() {
-            items.push(MobileItem {
-                lines: vec![Line::from(Span::styled(
-                    "  no matching agents",
-                    Style::default()
-                        .fg(palette.overlay0)
-                        .bg(palette.panel_bg)
-                        .add_modifier(Modifier::DIM),
-                ))],
-                background: palette.panel_bg,
-                target: None,
-            });
-        }
-        for row in agents {
-            let endpoint = row.endpoint;
-            let agent = row.agent;
-            let workspace = endpoint
-                .snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id == agent.workspace_id);
-            let tab = endpoint
-                .snapshot
-                .tabs
-                .iter()
-                .find(|tab| tab.tab_id == agent.tab_id);
-            let agent_label = agent
-                .display_agent
-                .as_deref()
-                .or(agent.name.as_deref())
-                .or(agent.agent.as_deref())
-                .unwrap_or("agent");
-            let primary = workspace
-                .map(|workspace| workspace.label.as_str())
-                .unwrap_or(agent_label);
-            let mut detail = Vec::new();
-            let workspace_tab_count = endpoint
-                .snapshot
-                .tabs
-                .iter()
-                .filter(|candidate| candidate.workspace_id == agent.workspace_id)
-                .count();
-            if let Some(tab) = tab.filter(|tab| tab.custom_label || workspace_tab_count > 1) {
-                detail.push(tab.label.clone());
-            }
-            let status_key = status_text(agent.agent_status);
-            detail.push(
-                agent
-                    .state_labels
-                    .iter()
-                    .find(|(key, _)| key == status_key)
-                    .map(|(_, label)| label.clone())
-                    .unwrap_or_else(|| {
-                        if agent.agent_status == crate::api::schema::AgentStatus::Unknown {
-                            "idle".to_owned()
-                        } else {
-                            status_key.to_owned()
-                        }
-                    }),
-            );
-            detail.push(agent_label.to_owned());
-            if endpoint.stale() {
-                detail.push(mobile_endpoint_state(endpoint.status).to_owned());
-            }
-            let background = if endpoint.endpoint_id == active_endpoint_id && agent.focused {
-                palette.surface_dim
-            } else {
-                palette.panel_bg
-            };
-            let foreground = if endpoint.stale() {
-                palette.overlay0
-            } else {
-                palette.text
-            };
-            let dim = if endpoint.stale() {
-                Modifier::DIM
-            } else {
-                Modifier::empty()
-            };
-            items.push(MobileItem {
-                lines: vec![
-                    Line::from(vec![
-                        Span::styled("  ", Style::default().bg(background)),
-                        Span::styled(
-                            status_icon(agent.agent_status, config.status_indicators),
-                            Style::default()
-                                .fg(if endpoint.stale() {
-                                    palette.overlay0
-                                } else {
-                                    status_color(agent.agent_status, palette)
-                                })
-                                .bg(background)
-                                .add_modifier(dim),
-                        ),
-                        Span::styled(" ", Style::default().bg(background)),
-                        Span::styled(
-                            crate::ui::truncate_end(
-                                &format!("{} · {primary}", endpoint.label),
-                                usize::from(content_width.saturating_sub(5)),
-                            ),
-                            Style::default()
-                                .fg(foreground)
-                                .bg(background)
-                                .add_modifier(Modifier::BOLD | dim),
-                        ),
-                    ]),
-                    Line::from(Span::styled(
-                        crate::ui::truncate_end(
-                            &format!("  {}", detail.join(" · ")),
-                            usize::from(content_width),
-                        ),
+    if let Some(inbox) = inbox {
+        append_inbox_items(&mut items, inbox, endpoints, content_width, palette);
+    } else {
+        let agents = super::aggregate_navigation::aggregate_agent_rows(
+            endpoints,
+            active_endpoint_id,
+            config.agent_panel_sort,
+        );
+        let agent_view_label = snapshot.agent_view_label.as_deref();
+        if !agents.is_empty() || agent_view_label.is_some() {
+            let title = agent_view_label
+                .map(|label| format!("agents · {label}"))
+                .unwrap_or_else(|| "agents".to_owned());
+            items.push(MobileItem::section(title, palette));
+            if agents.is_empty() {
+                items.push(MobileItem {
+                    lines: vec![Line::from(Span::styled(
+                        "  no matching agents",
                         Style::default()
                             .fg(palette.overlay0)
-                            .bg(background)
-                            .add_modifier(dim),
-                    )),
-                ],
-                background,
-                target: Some(ClientMobileTarget::Agent {
-                    endpoint_id: endpoint.endpoint_id.clone(),
-                    pane_id: agent.pane_id.clone(),
-                }),
-            });
+                            .bg(palette.panel_bg)
+                            .add_modifier(Modifier::DIM),
+                    ))],
+                    background: palette.panel_bg,
+                    target: None,
+                });
+            }
+            for row in agents {
+                let endpoint = row.endpoint;
+                let agent = row.agent;
+                let workspace = endpoint
+                    .snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == agent.workspace_id);
+                let tab = endpoint
+                    .snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == agent.tab_id);
+                let agent_label = agent
+                    .display_agent
+                    .as_deref()
+                    .or(agent.name.as_deref())
+                    .or(agent.agent.as_deref())
+                    .unwrap_or("agent");
+                let primary = workspace
+                    .map(|workspace| workspace.label.as_str())
+                    .unwrap_or(agent_label);
+                let mut detail = Vec::new();
+                let workspace_tab_count = endpoint
+                    .snapshot
+                    .tabs
+                    .iter()
+                    .filter(|candidate| candidate.workspace_id == agent.workspace_id)
+                    .count();
+                if let Some(tab) = tab.filter(|tab| tab.custom_label || workspace_tab_count > 1) {
+                    detail.push(tab.label.clone());
+                }
+                let status_key = status_text(agent.agent_status);
+                detail.push(
+                    agent
+                        .state_labels
+                        .iter()
+                        .find(|(key, _)| key == status_key)
+                        .map(|(_, label)| label.clone())
+                        .unwrap_or_else(|| {
+                            if agent.agent_status == crate::api::schema::AgentStatus::Unknown {
+                                "idle".to_owned()
+                            } else {
+                                status_key.to_owned()
+                            }
+                        }),
+                );
+                detail.push(agent_label.to_owned());
+                if endpoint.stale() {
+                    detail.push(mobile_endpoint_state(endpoint.status).to_owned());
+                }
+                let background = if endpoint.endpoint_id == active_endpoint_id && agent.focused {
+                    palette.surface_dim
+                } else {
+                    palette.panel_bg
+                };
+                let foreground = if endpoint.stale() {
+                    palette.overlay0
+                } else {
+                    palette.text
+                };
+                let dim = if endpoint.stale() {
+                    Modifier::DIM
+                } else {
+                    Modifier::empty()
+                };
+                items.push(MobileItem {
+                    lines: vec![
+                        Line::from(vec![
+                            Span::styled("  ", Style::default().bg(background)),
+                            Span::styled(
+                                status_icon(agent.agent_status, config.status_indicators),
+                                Style::default()
+                                    .fg(if endpoint.stale() {
+                                        palette.overlay0
+                                    } else {
+                                        status_color(agent.agent_status, palette)
+                                    })
+                                    .bg(background)
+                                    .add_modifier(dim),
+                            ),
+                            Span::styled(" ", Style::default().bg(background)),
+                            Span::styled(
+                                crate::ui::truncate_end(
+                                    &format!("{} · {primary}", endpoint.label),
+                                    usize::from(content_width.saturating_sub(5)),
+                                ),
+                                Style::default()
+                                    .fg(foreground)
+                                    .bg(background)
+                                    .add_modifier(Modifier::BOLD | dim),
+                            ),
+                        ]),
+                        Line::from(Span::styled(
+                            crate::ui::truncate_end(
+                                &format!("  {}", detail.join(" · ")),
+                                usize::from(content_width),
+                            ),
+                            Style::default()
+                                .fg(palette.overlay0)
+                                .bg(background)
+                                .add_modifier(dim),
+                        )),
+                    ],
+                    background,
+                    target: Some(ClientMobileTarget::Agent {
+                        endpoint_id: endpoint.endpoint_id.clone(),
+                        pane_id: agent.pane_id.clone(),
+                    }),
+                });
+            }
         }
     }
 
@@ -1003,6 +1018,20 @@ impl ClientShellState {
             .find(|(rect, _)| super::contains(*rect, point))
             .map(|(_, target)| target.clone());
         match target {
+            Some(ClientMobileTarget::InboxSection(section)) => {
+                let old = self.visible_conversations();
+                self.agent_inbox_expanded[section] = !self.agent_inbox_expanded[section];
+                self.reconcile_conversation_selection(&old);
+                self.persist_chrome_preferences(outcome);
+            }
+            Some(ClientMobileTarget::Conversation {
+                endpoint_id,
+                conversation_id,
+            }) => {
+                self.open_conversation(endpoint_id, conversation_id, false, outcome);
+                self.mode = ClientShellMode::Terminal;
+                self.navigate_workspace_id = None;
+            }
             Some(ClientMobileTarget::Machine(endpoint_id)) => {
                 if endpoint_id == self.active_endpoint_id {
                     self.mode = ClientShellMode::Terminal;
@@ -1129,6 +1158,106 @@ fn render_left_scrollbar(
                 "▌",
                 Style::default().fg(palette.accent).bg(palette.panel_bg),
             );
+        }
+    }
+}
+
+fn append_inbox_items(
+    items: &mut Vec<MobileItem>,
+    inbox: MobileInbox<'_>,
+    endpoints: &[ClientShellEndpoint],
+    content_width: u16,
+    palette: &Palette,
+) {
+    for endpoint in endpoints {
+        if let Some(cache) = &endpoint.conversations {
+            if cache.projection.next_offset.is_some() {
+                items.push(MobileItem::section(
+                    format!(
+                        "{}: loading {}/{} conversations",
+                        endpoint.label,
+                        cache.projection.conversations.len(),
+                        cache.projection.total_count
+                    ),
+                    palette,
+                ));
+            }
+            if let Some(error) = &cache.projection.recovery_error {
+                items.push(MobileItem::section(
+                    format!("{}: {error}", endpoint.label),
+                    palette,
+                ));
+            }
+        }
+    }
+    for (section, title) in ["Inbox", "Working", "Settled"].into_iter().enumerate() {
+        let count = inbox
+            .rows
+            .iter()
+            .filter(|row| row.section == section)
+            .count();
+        let mut header = MobileItem::section(
+            format!(
+                "{} {title} ({count})",
+                if inbox.expanded[section] {
+                    "▾"
+                } else {
+                    "▸"
+                }
+            ),
+            palette,
+        );
+        header.target = Some(ClientMobileTarget::InboxSection(section));
+        items.push(header);
+        if !inbox.expanded[section] {
+            continue;
+        }
+        for row in inbox.rows.iter().filter(|row| row.section == section) {
+            let selected = inbox
+                .selected
+                .is_some_and(|selected| selected.0 == row.endpoint_id && selected.1 == row.id);
+            let unread = row.attention
+                > inbox
+                    .read
+                    .get(&format!("{}:{}", row.endpoint_id.storage_key(), row.id))
+                    .copied()
+                    .unwrap_or(0);
+            let background = if selected {
+                palette.active_row_bg
+            } else {
+                palette.panel_bg
+            };
+            let foreground = if row.unavailable {
+                palette.overlay0
+            } else {
+                palette.text
+            };
+            items.push(MobileItem {
+                lines: vec![
+                    Line::from(Span::styled(
+                        crate::ui::truncate_end(
+                            &format!("  {}{}", if unread { "● " } else { "" }, row.label),
+                            usize::from(content_width),
+                        ),
+                        Style::default()
+                            .fg(foreground)
+                            .bg(background)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        crate::ui::truncate_end(
+                            &format!("  {}", row.detail),
+                            usize::from(content_width),
+                        ),
+                        Style::default().fg(palette.overlay0).bg(background),
+                    )),
+                ],
+                background,
+                target: Some(ClientMobileTarget::Conversation {
+                    endpoint_id: row.endpoint_id.clone(),
+                    conversation_id: row.id.clone(),
+                }),
+            });
         }
     }
 }

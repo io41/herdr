@@ -4,8 +4,25 @@ impl ClientContextMenuOverlay {
     pub(super) fn items(&self) -> Vec<ClientContextMenuItem> {
         use ClientContextMenuAction as Action;
 
-        let item = |label, action| ClientContextMenuItem { label, action };
+        let item = |label: &str, action| ClientContextMenuItem {
+            label: label.into(),
+            action,
+        };
         match &self.target {
+            ClientContextMenuTarget::Conversation {
+                record,
+                available,
+                methods,
+                ..
+            } => super::agent_inbox::conversation_menu_items(record, *available, methods),
+            ClientContextMenuTarget::ConversationLocations { locations, .. } => locations
+                .iter()
+                .enumerate()
+                .map(|(index, (_, _, label))| ClientContextMenuItem {
+                    label: format!("Resume in {label}"),
+                    action: Action::ConversationLocation(index),
+                })
+                .collect(),
             ClientContextMenuTarget::Workspace { is_git: false, .. } => {
                 vec![item("Rename", Action::Rename), item("Close", Action::Close)]
             }
@@ -192,6 +209,23 @@ impl ClientShellState {
             return;
         };
         match menu.target {
+            ClientContextMenuTarget::Conversation {
+                endpoint_id,
+                record,
+                ..
+            } => self.activate_conversation_action(endpoint_id, *record, action, outcome),
+            ClientContextMenuTarget::ConversationLocations {
+                endpoint_id,
+                record,
+                cwd,
+                locations,
+            } => {
+                if let ClientContextMenuAction::ConversationLocation(index) = action {
+                    if let Some((workspace_id, tab_id, _)) = locations.get(index) {
+                        self.push_conversation_method(endpoint_id, crate::api::schema::Method::AgentConversationResume(crate::api::schema::AgentConversationResumeParams { conversation_id: record.id, expected_revision: record.revision, location: Some(crate::api::schema::AgentConversationResumeLocation::Choose { workspace_id: workspace_id.clone(), tab_id: Some(tab_id.clone()), cwd: Some(cwd) }) }), outcome);
+                    }
+                }
+            }
             ClientContextMenuTarget::Workspace {
                 workspace_id,
                 close_group,

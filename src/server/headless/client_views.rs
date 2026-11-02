@@ -959,3 +959,86 @@ impl HeadlessServer {
         changed | navigation_changed | geometry_changed
     }
 }
+
+impl HeadlessServer {
+    /// Send lifecycle changes to all shell clients, including inactive surfaces.
+    pub(super) fn stream_agent_conversations(&mut self) {
+        let revision = self.app.agent_inbox.revision();
+        let error = self
+            .app
+            .agent_inbox
+            .recovery_error
+            .clone()
+            .or_else(|| self.app.agent_inbox_error.clone());
+        let targets: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|(_, client)| {
+                client.is_shell_client()
+                    && (client.shell_agent_conversations_revision != Some(revision)
+                        || client.shell_agent_conversations_error != error)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let mut projection = self.app.agent_conversations_projection();
+        projection.boot_id = self.client_shell_boot_id.clone();
+        let framed = crate::protocol::endpoint::agent_conversations_message(&projection)
+            .map_err(std::io::Error::other)
+            .and_then(|message| {
+                Self::frame_server_message(&message).map_err(std::io::Error::other)
+            });
+        let framed = match framed {
+            Ok(framed) => framed,
+            Err(error) => {
+                tracing::warn!(%error, "failed to encode agent conversations");
+                return;
+            }
+        };
+        for id in targets {
+            if let Some(client) = self.clients.get_mut(&id) {
+                if client
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.control.send(framed.clone()).is_ok())
+                {
+                    client.shell_agent_conversations_revision = Some(revision);
+                    client.shell_agent_conversations_error = error.clone();
+                }
+            }
+        }
+    }
+}
+
+impl HeadlessServer {
+    pub(super) fn handle_client_conversation_open_request(
+        &mut self,
+        client_id: u64,
+        mut message: api::ApiRequestMessage,
+    ) -> bool {
+        let focus_before = self.shell_focus_target(client_id);
+        let focused_tabs_before = self.focused_shell_tabs();
+        let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
+        let original = std::mem::replace(&mut message.respond_to, proxy_tx);
+        let changed = self.handle_api_request_with_shutdown_check_inner(message, true, true);
+        let result = forward_proxied_api_response(Some((original, proxy_rx)));
+        if matches!(
+            result,
+            Some(api::schema::ResponseResult::AgentConversationOpened { .. })
+        ) {
+            self.focus_shell_client_on_default_target(client_id);
+            let focus_after = self.shell_focus_target(client_id);
+            let focused_tabs_after = self.focused_shell_tabs();
+            self.app.accept_current_focus_without_events();
+            self.send_shell_navigation_focus_events(
+                focus_before.as_ref(),
+                focus_after.as_ref(),
+                &focused_tabs_before,
+                &focused_tabs_after,
+            );
+        }
+        changed
+    }
+}

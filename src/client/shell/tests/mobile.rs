@@ -672,3 +672,180 @@ fn mobile_switcher_scroll_close_and_width_transition_clear_mobile_hits() {
     assert!(state.hits.mobile_close.is_empty());
     assert!(state.hits.mobile_targets.is_empty());
 }
+
+fn mobile_conversation(
+    id: &str,
+    section: crate::agent_inbox::ConversationSection,
+    attached: bool,
+) -> crate::agent_inbox::ConversationRecord {
+    let attachment = serde_json::json!({"terminal_id":format!("terminal-{id}"),"pane_id":1,"public_pane_id":"pane_1","workspace_id":"ws_1","tab_id":"tab_1","workspace_location_id":"stable-space","tab_location_id":"stable-tab","cwd":"/repo"});
+    serde_json::from_value(serde_json::json!({"id":id,"provider":"codex","source":"hook","session_ref":{"kind":"id","value":id},"title":id,"saved_location":attachment,"disposition":if section==crate::agent_inbox::ConversationSection::Settled{"settled"}else{"inbox"},"created_at_ms":1,"attention_returned_at_ms":20,"completed_at_ms":20,"last_human_submission_at_ms":10,"settled_at_ms":30,"revision":1,"attachments":if attached{vec![attachment]}else{vec![]},"section":section,"execution":if section==crate::agent_inbox::ConversationSection::Working{"working"}else if attached{"idle"}else{"closed"},"queued_human_work":false,"blocking_request":false,"failure":false,"capability_limits":[],"resume_state":"none"})).unwrap()
+}
+
+fn mobile_inbox_state(records: Vec<crate::agent_inbox::ConversationRecord>) -> ClientShellState {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.set_endpoint_agent_conversations_supported(&ClientEndpointId::Local, true);
+    state.set_endpoint_methods_for(
+        &ClientEndpointId::Local,
+        Some(vec!["agent.conversation.open".into()]),
+    );
+    state.set_endpoint_agent_conversations(
+        &ClientEndpointId::Local,
+        None,
+        crate::client::endpoint::ClientAgentConversationsProjection {
+            boot_id: "boot-1".into(),
+            revision: 1,
+            total_count: records.len(),
+            conversations: records,
+            next_offset: None,
+            recovery_error: None,
+        },
+    );
+    state.agent_inbox = true;
+    state.mode = ClientShellMode::Navigate;
+    state
+}
+
+fn mobile_click(rect: Rect) -> RawInputEvent {
+    RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::empty(),
+    })
+}
+
+#[test]
+fn mobile_inbox_uses_grouped_counts_read_dots_and_section_toggles_without_focus() {
+    use crate::agent_inbox::ConversationSection;
+    let mut state = mobile_inbox_state(vec![
+        mobile_conversation("inbox-done", ConversationSection::Inbox, true),
+        mobile_conversation("working-hidden", ConversationSection::Working, true),
+        mobile_conversation("settled-hidden", ConversationSection::Settled, false),
+    ]);
+    let frame = state.compose(44, 50).unwrap();
+    let text = frame
+        .cells
+        .iter()
+        .map(|cell| cell.symbol.as_str())
+        .collect::<String>();
+    for label in ["Inbox (1)", "Working (1)", "Settled (1)", "● inbox-done"] {
+        assert!(text.contains(label), "missing {label}");
+    }
+    assert!(!text.contains("working-hidden"));
+    assert!(!text.contains("settled-hidden"));
+    assert!(state
+        .hits
+        .mobile_targets
+        .iter()
+        .any(|(_, target)| matches!(target, ClientMobileTarget::Workspace { .. })));
+    assert!(state
+        .hits
+        .mobile_targets
+        .iter()
+        .any(|(_, target)| matches!(target, ClientMobileTarget::Tab { .. })));
+    assert!(!state
+        .hits
+        .mobile_targets
+        .iter()
+        .any(|(_, target)| matches!(target, ClientMobileTarget::Agent { .. })));
+    let header = state
+        .hits
+        .mobile_targets
+        .iter()
+        .find_map(|(rect, target)| {
+            matches!(target, ClientMobileTarget::InboxSection(1)).then_some(*rect)
+        })
+        .unwrap();
+    let focused = state.snapshot.as_ref().unwrap().focused_pane_id.clone();
+    let outcome = state.handle_raw_events(vec![mobile_click(header)]);
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.requests.is_empty());
+    assert_eq!(state.mode, ClientShellMode::Navigate);
+    assert_eq!(state.snapshot.as_ref().unwrap().focused_pane_id, focused);
+    state.compose(44, 50).unwrap();
+    assert!(state.hits.mobile_targets.iter().any(|(_,target)|matches!(target,ClientMobileTarget::Conversation{conversation_id,..}if conversation_id=="working-hidden")));
+    state.agent_inbox_selected = Some((ClientEndpointId::Local, "working-hidden".into()));
+    let header = state
+        .hits
+        .mobile_targets
+        .iter()
+        .find_map(|(rect, target)| {
+            matches!(target, ClientMobileTarget::InboxSection(1)).then_some(*rect)
+        })
+        .unwrap();
+    let outcome = state.handle_raw_events(vec![mobile_click(header)]);
+    assert!(outcome.actions.is_empty());
+    assert!(!state.agent_inbox_expanded[1]);
+    assert_eq!(
+        state
+            .agent_inbox_selected
+            .as_ref()
+            .map(|selected| selected.1.as_str()),
+        Some("inbox-done")
+    );
+}
+
+#[test]
+fn mobile_inbox_mouse_and_numbered_navigation_share_mixed_endpoint_closed_order() {
+    use crate::agent_inbox::ConversationSection;
+    let mut state = mobile_inbox_state(vec![mobile_conversation(
+        "local-live",
+        ConversationSection::Inbox,
+        true,
+    )]);
+    let remote_id = ClientEndpointId::Ssh(
+        crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+    );
+    let mut remote = state.endpoints[0].clone();
+    remote.endpoint_id = remote_id.clone();
+    remote.label = "Build".into();
+    let mut closed = mobile_conversation("remote-closed", ConversationSection::Inbox, false);
+    closed.attention_returned_at_ms = 30;
+    let cache = remote.conversations.as_mut().unwrap();
+    cache.projection.conversations = vec![closed];
+    state.endpoints.push(remote);
+    state.compose(44, 50).unwrap();
+    let mouse_order = state
+        .hits
+        .mobile_targets
+        .iter()
+        .filter_map(|(_, target)| {
+            if let ClientMobileTarget::Conversation {
+                endpoint_id,
+                conversation_id,
+            } = target
+            {
+                Some((endpoint_id.clone(), conversation_id.clone()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let projected = state
+        .visible_conversations()
+        .iter()
+        .map(|row| (row.endpoint_id.clone(), row.id.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(mouse_order, projected);
+    assert_eq!(mouse_order[0].1, "remote-closed");
+    let closed_hit=state.hits.mobile_targets.iter().find_map(|(rect,target)|matches!(target,ClientMobileTarget::Conversation{conversation_id,..}if conversation_id=="remote-closed").then_some(*rect)).unwrap();
+    let outcome = state.handle_raw_events(vec![mobile_click(closed_hit)]);
+    assert!(outcome.actions.is_empty());
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::ContextMenu(_))
+    ));
+    state.overlay = None;
+    let mut outcome = ClientShellInput::default();
+    state.handle_conversation_navigation(crate::input::KeybindAction::FocusAgent(1), &mut outcome);
+    assert_eq!(state.agent_inbox_selected.as_ref(), Some(&mouse_order[1]));
+    assert!(outcome.actions.iter().any(|action|matches!(action,ClientShellAction::Endpoint{endpoint_id,request,..}if endpoint_id==&ClientEndpointId::Local&&matches!(&request.method,crate::api::schema::Method::AgentConversationOpen(params)if params.conversation_id=="local-live"))));
+    state.mode = ClientShellMode::Navigate;
+    state.compose(44, 50).unwrap();
+    let live_hit=state.hits.mobile_targets.iter().find_map(|(rect,target)|matches!(target,ClientMobileTarget::Conversation{conversation_id,..}if conversation_id=="local-live").then_some(*rect)).unwrap();
+    let mouse = state.handle_raw_events(vec![mobile_click(live_hit)]);
+    assert!(mouse.actions.iter().any(|action|matches!(action,ClientShellAction::Endpoint{request,..}if matches!(&request.method,crate::api::schema::Method::AgentConversationOpen(params)if params.conversation_id=="local-live"))));
+}

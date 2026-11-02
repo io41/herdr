@@ -69,6 +69,7 @@ impl App {
             self.emit_workspace_token_updated(ws_idx);
         }
         self.sync_agent_metadata_deadline();
+        self.sync_agent_conversations();
     }
 
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
@@ -166,6 +167,7 @@ impl App {
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
+            self.agent_inbox_deadline,
             self.pending_agent_resume_deadline,
             self.pending_host_appearance_deadline,
             self.session_save_deadline,

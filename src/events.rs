@@ -76,6 +76,12 @@ pub(crate) struct WorktreeReadData {
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
+    /// PTY input submission finished; acknowledge only after lifecycle persistence.
+    AgentConversationPromptCompleted {
+        conversation_id: String,
+        submitted: bool,
+        acknowledge: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     /// A pane's child process exited.
     PaneDied {
         pane_id: PaneId,

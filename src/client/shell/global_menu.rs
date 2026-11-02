@@ -4,6 +4,9 @@ use super::*;
 pub(super) enum ClientGlobalMenuAction {
     Binding(crate::input::KeybindAction),
     WhatsNew,
+    ToggleAgentInbox,
+    ConversationActions,
+    ToggleInboxSection(usize),
 }
 
 pub(super) fn global_menu_attention(snapshot: &ClientShellSnapshot) -> bool {
@@ -50,6 +53,24 @@ pub(super) fn global_menu_items(
         "detach",
         ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Detach),
     ));
+    items.push((
+        "conversation actions...",
+        ClientGlobalMenuAction::ConversationActions,
+    ));
+    items.push((
+        "agent inbox / flat",
+        ClientGlobalMenuAction::ToggleAgentInbox,
+    ));
+    for (index, label) in [
+        "toggle Inbox section",
+        "toggle Working section",
+        "toggle Settled section",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        items.push((label, ClientGlobalMenuAction::ToggleInboxSection(index)));
+    }
     items
 }
 
@@ -103,7 +124,25 @@ impl ClientShellState {
             ClientGlobalMenuAction::Binding(binding) => {
                 self.record_binding(crate::input::KeybindMatch::Action(binding), outcome)
             }
+            ClientGlobalMenuAction::ToggleInboxSection(section) => {
+                let old = self.visible_conversations();
+                self.agent_inbox_expanded[section] = !self.agent_inbox_expanded[section];
+                self.reconcile_conversation_selection(&old);
+                self.persist_chrome_preferences(outcome);
+            }
+            ClientGlobalMenuAction::ConversationActions => {
+                if let Some((endpoint_id, id)) = self.agent_inbox_selected.clone() {
+                    self.open_conversation(endpoint_id, id, true, outcome);
+                } else {
+                    self.set_endpoint_error("Select a conversation before opening its actions");
+                }
+            }
             ClientGlobalMenuAction::WhatsNew => self.open_release_notes(),
+            ClientGlobalMenuAction::ToggleAgentInbox => {
+                self.agent_inbox = !self.agent_inbox;
+                self.agent_scroll = 0;
+                self.persist_chrome_preferences(outcome);
+            }
         }
         outcome.repaint = true;
     }

@@ -65,7 +65,15 @@ impl HeadlessServer {
             self.send_to_client(client_id, message);
             return false;
         }
-        if !surface_active {
+        let conversation_method = matches!(
+            &request.method,
+            api::schema::Method::AgentConversationOpen(_)
+                | api::schema::Method::AgentConversationList(_)
+                | api::schema::Method::AgentConversationSettle(_)
+                | api::schema::Method::AgentConversationReopen(_)
+                | api::schema::Method::AgentConversationResume(_)
+        );
+        if !surface_active && !conversation_method {
             let message = crate::server::client_commands::error_message(
                 boot_id,
                 request_id,
@@ -119,15 +127,21 @@ impl HeadlessServer {
                 deferred_worktree.then(|| api_request_id.clone());
             client.shell_deferred_navigation_response = deferred_navigation.then(Vec::new);
         }
+        let message = api::ApiRequestMessage {
+            request: *request,
+            respond_to,
+            response_write_complete: None,
+        };
+        if matches!(
+            &message.request.method,
+            api::schema::Method::AgentConversationOpen(_)
+        ) {
+            return self.handle_client_conversation_open_request(client_id, message);
+        }
+        if conversation_method {
+            return self.handle_api_request_with_shutdown_check_inner(message, true, true);
+        }
         let foreground_changed = self.promote_client_to_foreground(client_id);
-        foreground_changed
-            | self.handle_client_shell_api_request(
-                client_id,
-                api::ApiRequestMessage {
-                    request: *request,
-                    respond_to,
-                    response_write_complete: None,
-                },
-            )
+        foreground_changed | self.handle_client_shell_api_request(client_id, message)
     }
 }

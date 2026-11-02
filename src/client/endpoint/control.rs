@@ -1,5 +1,7 @@
 use super::ClientEndpointId;
 
+pub(crate) use crate::protocol::endpoint::EndpointAgentConversations as ClientAgentConversationsProjection;
+
 pub(crate) struct DecodedAgentViewProjection {
     pub(crate) boot_id: String,
     pub(crate) revision: u64,
@@ -10,6 +12,7 @@ pub(crate) enum EndpointControlMessage {
     HealthPong,
     AgentViewProjection(DecodedAgentViewProjection),
     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
+    AgentConversations(ClientAgentConversationsProjection),
     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
     Ignored,
 }
@@ -25,6 +28,24 @@ pub(crate) fn decode_endpoint_control(
         return Ok(serde_json::from_str(data)
             .map(EndpointControlMessage::AgentCompletions)
             .unwrap_or(EndpointControlMessage::Ignored));
+    }
+    if kind == crate::protocol::endpoint::AGENT_CONVERSATIONS_KIND {
+        if data.len() > crate::protocol::MAX_FRAME_SIZE {
+            return Ok(EndpointControlMessage::Ignored);
+        }
+        let Ok(projection): Result<ClientAgentConversationsProjection, _> =
+            serde_json::from_str(data)
+        else {
+            return Ok(EndpointControlMessage::Ignored);
+        };
+        if projection
+            .conversations
+            .iter()
+            .any(|record| crate::agent_inbox::validate_record(record).is_err())
+        {
+            return Ok(EndpointControlMessage::Ignored);
+        }
+        return Ok(EndpointControlMessage::AgentConversations(projection));
     }
     if kind == crate::protocol::endpoint::AGENT_VIEW_PROJECTION_KIND {
         let Ok(projection): Result<crate::protocol::endpoint::EndpointAgentViewProjection, _> =
@@ -105,6 +126,64 @@ mod tests {
             decode_endpoint_control(&kind, "invalid").unwrap(),
             EndpointControlMessage::Ignored
         ));
+    }
+
+    #[test]
+    fn conversation_companion_reaches_inactive_endpoints_without_presentation_effects() {
+        let projection = ClientAgentConversationsProjection {
+            boot_id: "boot".into(),
+            revision: 7,
+            conversations: Vec::new(),
+            recovery_error: Some("registry recovery failed".into()),
+            total_count: 0,
+            next_offset: None,
+        };
+        let message = crate::protocol::endpoint::agent_conversations_message(&projection).unwrap();
+        assert!(crate::client::endpoint::accepts_endpoint_message(
+            false, false, false, &message,
+        ));
+        assert!(!crate::client::endpoint::is_presentation_effect(&message));
+        let crate::protocol::ServerMessage::EndpointControl { kind, data } = message else {
+            panic!("expected optional control");
+        };
+        let EndpointControlMessage::AgentConversations(decoded) =
+            decode_endpoint_control(&kind, &data).unwrap()
+        else {
+            panic!("expected conversation projection");
+        };
+        assert_eq!(decoded, projection);
+    }
+
+    #[test]
+    fn conversation_companion_rejects_invalid_and_oversized_optional_data() {
+        let kind = crate::protocol::endpoint::AGENT_CONVERSATIONS_KIND;
+        let oversized = format!(
+            "{}{}",
+            r#"{"boot_id":"boot","revision":1,"conversations":[]}"#,
+            " ".repeat(crate::protocol::MAX_FRAME_SIZE),
+        );
+        for data in [
+            "invalid".into(),
+            r#"{"boot_id":"boot","revision":1,"conversations":[{}]}"#.into(),
+            oversized,
+        ] {
+            assert!(matches!(
+                decode_endpoint_control(kind, &data).unwrap(),
+                EndpointControlMessage::Ignored
+            ));
+        }
+    }
+
+    #[test]
+    fn conversation_companion_defaults_optional_recovery_error() {
+        let EndpointControlMessage::AgentConversations(decoded) = decode_endpoint_control(
+            crate::protocol::endpoint::AGENT_CONVERSATIONS_KIND,
+            r#"{"boot_id":"boot","revision":1,"conversations":[]}"#,
+        )
+        .unwrap() else {
+            panic!("expected conversation projection");
+        };
+        assert_eq!(decoded.recovery_error, None);
     }
 
     #[test]

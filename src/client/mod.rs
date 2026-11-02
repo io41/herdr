@@ -516,6 +516,17 @@ async fn run_client_loop(
                     })
                 }),
         );
+        shell.set_endpoint_agent_conversations_supported(
+            &endpoint::ClientEndpointId::Local,
+            initial
+                .as_ref()
+                .and_then(|(_, handshake)| handshake.endpoint_capabilities.as_ref())
+                .is_some_and(|capabilities| {
+                    capabilities.iter().any(|capability| {
+                        capability == crate::protocol::endpoint::AGENT_CONVERSATIONS_CAPABILITY
+                    })
+                }),
+        );
         if local_unavailable {
             shell.set_endpoint_status(
                 &endpoint::ClientEndpointId::Local,
@@ -1387,11 +1398,18 @@ async fn run_client_loop(
                     let agent_view_projection_supported = negotiation.supports_capability(
                         crate::protocol::endpoint::AGENT_VIEW_PROJECTION_CAPABILITY,
                     );
+                    let agent_conversations_supported = negotiation.supports_capability(
+                        crate::protocol::endpoint::AGENT_CONVERSATIONS_CAPABILITY,
+                    );
                     let frame = state.shell.as_mut().and_then(|shell| {
                         shell.set_endpoint_methods_for(&endpoint_id, Some(negotiation.methods()));
                         shell.set_endpoint_agent_view_projection_supported(
                             &endpoint_id,
                             agent_view_projection_supported,
+                        );
+                        shell.set_endpoint_agent_conversations_supported(
+                            &endpoint_id,
+                            agent_conversations_supported,
                         );
                         shell.compose(state.reported_size.0, state.reported_size.1)
                     });
@@ -1940,7 +1958,12 @@ async fn run_client_loop(
                             || (false, Vec::new()),
                             |shell| {
                                 if completed.generation == generation
-                                    && shell.endpoint_is_active(&completed.endpoint_id)
+                                    && (shell.endpoint_is_active(&completed.endpoint_id)
+                                        || shell.conversation_request_is_endpoint_qualified(
+                                            &completed.request_id,
+                                            &completed.endpoint_id,
+                                            generation,
+                                        ))
                                 {
                                     shell.handle_endpoint_result(
                                         &completed.boot_id,
@@ -1970,7 +1993,16 @@ async fn run_client_loop(
                             &mut state.detached_process_children,
                             &mut scheduled_activation,
                         )?;
-                        let repaint = repaint || dispatch_repaint;
+                        let mut repaint = repaint || dispatch_repaint;
+                        if !endpoint_active {
+                            let cancelled =
+                                endpoint_commands.send_next(&endpoint_id, &mut write_stream);
+                            if let Some(shell) = state.shell.as_mut() {
+                                for request_id in cancelled {
+                                    repaint |= shell.cancel_endpoint_request(&request_id);
+                                }
+                            }
+                        }
                         if replay_mouse.is_empty() {
                             if repaint {
                                 if let Some(frame) = state.shell.as_mut().and_then(|shell| {
@@ -2133,6 +2165,43 @@ async fn run_client_loop(
                                         generation,
                                         projection,
                                     );
+                                }
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::AgentConversations(
+                                projection,
+                            )) => {
+                                let (repaint, actions) = state.shell.as_mut().map_or_else(
+                                    || (false, Vec::new()),
+                                    |shell| {
+                                        let repaint = shell.set_endpoint_agent_conversations(
+                                            &endpoint_id,
+                                            Some(generation),
+                                            projection,
+                                        );
+                                        (repaint, shell.take_conversation_actions())
+                                    },
+                                );
+                                let (_, dispatch_repaint) = dispatch_client_shell_actions(
+                                    actions,
+                                    &mut endpoint_commands,
+                                    &mut write_stream,
+                                    state.shell.as_mut(),
+                                    &mut state.detached_process_children,
+                                    &mut scheduled_activation,
+                                )?;
+                                let frame = (repaint || dispatch_repaint)
+                                    .then(|| {
+                                        state.shell.as_mut().and_then(|shell| {
+                                            shell.compose(
+                                                state.reported_size.0,
+                                                state.reported_size.1,
+                                            )
+                                        })
+                                    })
+                                    .flatten();
+                                if let Some(frame) = frame {
+                                    state.present_frame(frame);
                                 }
                                 continue;
                             }
@@ -2334,7 +2403,13 @@ async fn run_client_loop(
                         let shell = state.shell.as_mut().expect("checked shell mode");
                         let mut outcome = shell.tick_selection_autoscroll(now);
                         for expired in expired_endpoints {
-                            if !shell.endpoint_is_active(&expired.endpoint_id) {
+                            if !shell.endpoint_is_active(&expired.endpoint_id)
+                                && !shell.conversation_request_is_endpoint_qualified(
+                                    &expired.request_id,
+                                    &expired.endpoint_id,
+                                    expired.generation,
+                                )
+                            {
                                 continue;
                             }
                             let (repaint, actions) = shell.handle_endpoint_result(
@@ -2344,6 +2419,13 @@ async fn run_client_loop(
                             );
                             outcome.repaint |= repaint;
                             outcome.actions.extend(actions);
+                            if !shell.endpoint_is_active(&expired.endpoint_id) {
+                                for request_id in endpoint_commands
+                                    .send_next(&expired.endpoint_id, &mut write_stream)
+                                {
+                                    outcome.repaint |= shell.cancel_endpoint_request(&request_id);
+                                }
+                            }
                         }
                         let (effects, notification_repaint) = shell.tick_notifications(now);
                         outcome.repaint |= notification_repaint

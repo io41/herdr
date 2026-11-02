@@ -295,6 +295,14 @@ impl ClientShellState {
             return;
         };
         let activated = match target {
+            ClientNavigatorTarget::Conversation {
+                endpoint_id,
+                conversation_id,
+            } => {
+                self.overlay = None;
+                self.open_conversation(endpoint_id, conversation_id, false, outcome);
+                return;
+            }
             ClientNavigatorTarget::Machine { endpoint_id } => {
                 self.activate_endpoint(endpoint_id, outcome)
             }
@@ -942,6 +950,13 @@ impl ClientShellState {
         };
         let trimmed = rename.input.trim();
         let method = match rename.target {
+            ClientRenameTarget::ConversationCwd {
+                endpoint_id,
+                record,
+            } => {
+                self.choose_conversation_location(endpoint_id, record, trimmed.to_owned(), outcome);
+                return;
+            }
             ClientRenameTarget::NewWorkspace {
                 source_workspace_id,
                 cwd,

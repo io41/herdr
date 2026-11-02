@@ -255,6 +255,31 @@ mod tests {
             Some("f5e4a3e01453ae7b188f127ce951c12c20e0bebcc17cc364eeb6d1a01fd5bf81")
         );
 
+        for (method, digest) in [
+            (
+                "agent.conversation.open",
+                "4a66c0fd7187e43ddc5c253f8b00fcfce2a48f822a764d3bec1b8c54e449c058",
+            ),
+            (
+                "agent.conversation.list",
+                "a1902c406726c8fe9891403dc294f2643769eb3385f8383b9fd08ff5673221a3",
+            ),
+            (
+                "agent.conversation.reopen",
+                "3f3f654344ce2a725a38599b7ec04651c6b56430caa2c0a0d7f822ec3ea4701b",
+            ),
+            (
+                "agent.conversation.resume",
+                "66b099e9e203bebf070a210e2cc9932b7a74570c1a60e343e296fb51b9279558",
+            ),
+            (
+                "agent.conversation.settle",
+                "6ce47077e77058ca54b11f9dc6e3e396fad1b4910a8db4274a89d273c5e3c6f0",
+            ),
+        ] {
+            assert_eq!(actual.remove(method).as_deref(), Some(digest));
+        }
+
         assert_eq!(
             actual, expected,
             "an existing endpoint method changed shape; add load-bearing behavior as a new advertised method or explicitly gate new fields"

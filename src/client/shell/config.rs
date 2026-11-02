@@ -49,6 +49,9 @@ impl ClientShellState {
             .collect::<Vec<_>>();
         remote_collapsed_groups.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
         let preferences = preferences::ClientChromePreferences {
+            conversation_read: self.conversation_read.clone(),
+            agent_inbox: self.agent_inbox,
+            agent_inbox_expanded: Some(self.agent_inbox_expanded),
             sidebar_width: self.sidebar_width_manual.then_some(self.sidebar_width),
             sidebar_section_split: self
                 .sidebar_section_split_manual

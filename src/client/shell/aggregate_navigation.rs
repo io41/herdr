@@ -305,6 +305,23 @@ pub(super) fn navigator_rows(
         let stale = endpoint.status != ClientEndpointStatus::Online;
         let endpoint_query_matches = !query.is_empty() && text(&endpoint.label);
         let mut endpoint_rows = Vec::new();
+        let conversation_panes = endpoint
+            .conversations
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .projection
+                    .conversations
+                    .iter()
+                    .flat_map(|record| {
+                        record
+                            .attachments
+                            .iter()
+                            .map(|attachment| attachment.public_pane_id.as_str())
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
         if let Some(snapshot) = endpoint.snapshot.as_deref() {
             let agents = snapshot
                 .agents
@@ -345,6 +362,9 @@ pub(super) fn navigator_rows(
                         .map(Vec::as_slice)
                         .unwrap_or_default();
                     for (index, pane) in tab_panes.iter().enumerate() {
+                        if conversation_panes.contains(pane.pane_id.as_str()) {
+                            continue;
+                        }
                         let agent = agents.get(pane.pane_id.as_str()).copied();
                         let status = agent
                             .map_or(crate::api::schema::AgentStatus::Unknown, |agent| {
@@ -442,6 +462,62 @@ pub(super) fn navigator_rows(
                 }
             }
         }
+        if let Some(cache) = &endpoint.conversations {
+            let reserved =
+                super::agent_inbox::reserved_resume_terminals(&cache.projection.conversations);
+            for record in &cache.projection.conversations {
+                if super::agent_inbox::reserved_provisional(record, &reserved) {
+                    continue;
+                }
+                let status = if record.blocking_request || record.failure {
+                    crate::api::schema::AgentStatus::Blocked
+                } else if record.execution == crate::agent_inbox::ExecutionState::Working {
+                    crate::api::schema::AgentStatus::Working
+                } else if record.completed_at_ms.is_some() {
+                    crate::api::schema::AgentStatus::Done
+                } else {
+                    crate::api::schema::AgentStatus::Idle
+                };
+                if !filter(status)
+                    || !(endpoint_query_matches
+                        || text(&format!(
+                            "{} {} {} {} {}",
+                            record.title,
+                            record.provider,
+                            record.saved_location.cwd,
+                            record.saved_location.workspace_id,
+                            record.saved_location.tab_id
+                        )))
+                {
+                    continue;
+                }
+                endpoint_rows.push(ClientNavigatorRow {
+                    depth: u8::from(federated),
+                    label: record.title.clone(),
+                    meta: format!(
+                        "{} · {} · {:?}",
+                        record.provider,
+                        super::agent_inbox::record_status(record, stale),
+                        record.disposition
+                    ),
+                    detail: record.saved_location.cwd.clone(),
+                    agent: Some(record.provider.clone()),
+                    status: Some(status),
+                    stale: stale || !super::agent_inbox::cache_current(endpoint),
+                    current: endpoint.endpoint_id == *active_endpoint_id
+                        && endpoint.snapshot.as_deref().is_some_and(|snapshot| {
+                            record.attachments.iter().any(|attachment| {
+                                snapshot.focused_pane_id.as_ref()
+                                    == Some(&attachment.public_pane_id)
+                            })
+                        }),
+                    target: ClientNavigatorTarget::Conversation {
+                        endpoint_id: endpoint.endpoint_id.clone(),
+                        conversation_id: record.id.clone(),
+                    },
+                });
+            }
+        }
         if !filtering || endpoint_query_matches || !endpoint_rows.is_empty() {
             if federated {
                 rows.push(ClientNavigatorRow {
@@ -472,7 +548,12 @@ pub(super) fn navigator_selected_index(
         Some(target) => rows.iter().position(|row| row.target == *target),
         None => rows
             .iter()
-            .position(|row| matches!(row.target, ClientNavigatorTarget::Pane { .. }))
+            .position(|row| {
+                matches!(
+                    row.target,
+                    ClientNavigatorTarget::Pane { .. } | ClientNavigatorTarget::Conversation { .. }
+                )
+            })
             .or_else(|| (!rows.is_empty()).then_some(0)),
     }
 }

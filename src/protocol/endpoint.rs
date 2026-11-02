@@ -39,6 +39,32 @@ pub struct EndpointAgentCompletions {
     pub completions: std::collections::BTreeMap<String, u64>,
 }
 
+pub const AGENT_CONVERSATIONS_CAPABILITY: &str = "agent_conversations";
+pub const AGENT_CONVERSATIONS_KIND: &str = "endpoint.agent-conversations.v1";
+
+/// Optional JSON lifecycle data; never part of a frozen binary snapshot codec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointAgentConversations {
+    pub boot_id: String,
+    pub revision: u64,
+    pub conversations: Vec<crate::agent_inbox::ConversationRecord>,
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    pub next_offset: Option<usize>,
+    #[serde(default)]
+    pub recovery_error: Option<String>,
+}
+
+pub fn agent_conversations_message(
+    projection: &EndpointAgentConversations,
+) -> serde_json::Result<ServerMessage> {
+    Ok(ServerMessage::EndpointControl {
+        kind: AGENT_CONVERSATIONS_KIND.into(),
+        data: serde_json::to_string(projection)?,
+    })
+}
+
 fn default_true() -> bool {
     true
 }
@@ -174,6 +200,7 @@ impl EndpointServerWelcome {
                 HEALTH_CHECK_CAPABILITY.into(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.into(),
                 AGENT_COMPLETIONS_CAPABILITY.into(),
+                AGENT_CONVERSATIONS_CAPABILITY.into(),
             ],
             error: None,
         }
@@ -385,6 +412,7 @@ mod tests {
                 HEALTH_CHECK_CAPABILITY.to_string(),
                 AGENT_VIEW_PROJECTION_CAPABILITY.to_string(),
                 AGENT_COMPLETIONS_CAPABILITY.to_string(),
+                AGENT_CONVERSATIONS_CAPABILITY.to_string(),
             ]
         );
     }

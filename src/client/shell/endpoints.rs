@@ -17,6 +17,8 @@ pub(crate) struct ClientShellEndpoint {
     /// Connection generation that produced `snapshot`. `None` is reserved for local tests.
     pub(crate) snapshot_generation: Option<u64>,
     pub(crate) agent_recency: HashMap<String, u64>,
+    pub(super) conversations: Option<super::agent_inbox::CachedConversations>,
+    pub(super) conversations_supported: bool,
     pub(super) agent_presentation: super::endpoint_agent_state::EndpointAgentPresentation,
     pub(crate) agent_view_projection: Option<ClientEndpointAgentViewProjection>,
     pending_agent_view_projection: Option<ClientEndpointAgentViewProjection>,
@@ -75,6 +77,9 @@ impl ClientShellState {
                 ),
                 snapshot: previous.and_then(|endpoint| endpoint.snapshot.clone()),
                 snapshot_generation: previous.and_then(|endpoint| endpoint.snapshot_generation),
+                conversations: previous.and_then(|endpoint| endpoint.conversations.clone()),
+                conversations_supported: previous
+                    .is_some_and(|endpoint| endpoint.conversations_supported),
                 agent_recency: previous
                     .map(|endpoint| endpoint.agent_recency.clone())
                     .unwrap_or_default(),
@@ -673,7 +678,7 @@ impl ClientShellState {
         if changed {
             self.snapshot = self.endpoints[index].snapshot.clone();
         }
-        changed
+        self.acknowledge_visible_conversations(surface) || changed
     }
 
     #[cfg(test)]
@@ -737,6 +742,8 @@ pub(super) fn local_endpoint() -> ClientShellEndpoint {
         snapshot: None,
         snapshot_generation: None,
         agent_recency: HashMap::new(),
+        conversations: None,
+        conversations_supported: false,
         agent_presentation: Default::default(),
         agent_view_projection: None,
         pending_agent_view_projection: None,

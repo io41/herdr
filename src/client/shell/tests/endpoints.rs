@@ -2524,7 +2524,8 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
     assert!(rows.iter().all(|row| match row.target {
         ClientNavigatorTarget::Machine { .. } => row.depth == 0 && row.status.is_none(),
         ClientNavigatorTarget::Workspace { .. } => row.depth == 1 && row.status.is_none(),
-        ClientNavigatorTarget::Pane { .. } => row.depth == 2 && row.status.is_some(),
+        ClientNavigatorTarget::Conversation { .. } | ClientNavigatorTarget::Pane { .. } =>
+            row.depth == 2 && row.status.is_some(),
     }));
     assert_eq!(rows.iter().filter(|row| row.current).count(), 1);
 
@@ -2533,7 +2534,9 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
         let expected = match target {
             ClientNavigatorTarget::Machine { .. } => " ",
             ClientNavigatorTarget::Workspace { .. } => "   ",
-            ClientNavigatorTarget::Pane { .. } => "   └─ ",
+            ClientNavigatorTarget::Conversation { .. } | ClientNavigatorTarget::Pane { .. } => {
+                "   └─ "
+            }
         };
         let prefix = frame.cells[rect.y as usize * frame.width as usize + rect.x as usize..]
             .iter()
@@ -2571,7 +2574,8 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
         .all(|row| !matches!(row.target, ClientNavigatorTarget::Machine { .. })));
     assert!(rows.iter().all(|row| match row.target {
         ClientNavigatorTarget::Workspace { .. } => row.depth == 0,
-        ClientNavigatorTarget::Pane { .. } => row.depth == 1,
+        ClientNavigatorTarget::Conversation { .. } | ClientNavigatorTarget::Pane { .. } =>
+            row.depth == 1,
         ClientNavigatorTarget::Machine { .. } => false,
     }));
 }
@@ -2605,6 +2609,10 @@ fn navigator_keeps_saved_machine_visible_before_metadata_arrives() {
     assert!(!rows.iter().any(|row| match &row.target {
         ClientNavigatorTarget::Machine { .. } => false,
         ClientNavigatorTarget::Workspace {
+            endpoint_id: target,
+            ..
+        }
+        | ClientNavigatorTarget::Conversation {
             endpoint_id: target,
             ..
         }

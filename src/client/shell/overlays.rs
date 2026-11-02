@@ -115,8 +115,11 @@ pub(crate) fn render_global_menu(
     let rect = Rect::new(x, y, width, height);
     let inner = panel(buffer, rect, palette.accent, palette.panel_bg)?;
     let mut rows = Vec::new();
-    for (index, (label, action)) in items.iter().enumerate() {
-        let row_y = inner.y.saturating_add(index as u16);
+    let start = menu
+        .highlighted
+        .saturating_sub(usize::from(inner.height).saturating_sub(1));
+    for (index, (label, action)) in items.iter().enumerate().skip(start) {
+        let row_y = inner.y.saturating_add((index - start) as u16);
         if row_y >= inner.bottom() {
             break;
         }
@@ -168,17 +171,26 @@ pub(crate) fn render_context_menu(
     palette: &Palette,
 ) -> Option<OverlayRender> {
     let items = menu.items();
+    let details = super::agent_inbox::conversation_details(&menu.target);
     let screen = buffer.area;
     let max_item_width = items
         .iter()
-        .map(|item| display_width(item.label))
+        .map(|item| display_width(&item.label))
         .max()
         .unwrap_or(0);
     let width = max_item_width
+        .max(
+            details
+                .iter()
+                .map(|line| display_width(line))
+                .max()
+                .unwrap_or(0),
+        )
+        .min(80)
         .saturating_add(4)
         .max(14)
         .min(screen.width.max(1));
-    let height = (items.len() as u16)
+    let height = (items.len().saturating_add(details.len()) as u16)
         .saturating_add(2)
         .min(screen.height.max(1));
     let x = menu
@@ -192,8 +204,37 @@ pub(crate) fn render_context_menu(
     let rect = Rect::new(x, y, width, height);
     let inner = panel(buffer, rect, palette.accent, palette.panel_bg)?;
     let mut rows = Vec::new();
-    for (index, item) in items.iter().enumerate() {
-        let row_y = inner.y.saturating_add(index as u16);
+    let detail_rows = details.len().min(if items.is_empty() {
+        inner.height as usize
+    } else {
+        inner.height as usize / 2
+    });
+    let action_height = usize::from(inner.height).saturating_sub(detail_rows).max(1);
+    let action_start = menu.highlighted.saturating_sub(action_height - 1);
+    for (index, detail) in details.iter().take(detail_rows).enumerate() {
+        let y = inner.y.saturating_add(index as u16);
+        if y >= inner.bottom() {
+            break;
+        }
+        put_text(
+            buffer,
+            inner.x,
+            y,
+            inner.width,
+            detail,
+            Style::default().fg(palette.overlay0).bg(palette.panel_bg),
+        );
+    }
+    for (index, item) in items
+        .iter()
+        .enumerate()
+        .skip(action_start)
+        .take(action_height)
+    {
+        let row_y = inner
+            .y
+            .saturating_add(detail_rows as u16)
+            .saturating_add((index - action_start) as u16);
         if row_y >= inner.bottom() {
             break;
         }
@@ -208,7 +249,7 @@ pub(crate) fn render_context_menu(
             Style::default().fg(palette.text).bg(palette.panel_bg)
         };
         buffer.set_style(row, style);
-        put_text(buffer, row.x, row.y, row.width, item.label, style);
+        put_text(buffer, row.x, row.y, row.width, &item.label, style);
         rows.push((row, index));
     }
     Some(OverlayRender {
@@ -727,7 +768,7 @@ fn render_navigator_overlay(
         q.x + 2,
         q.y,
         q.width.saturating_sub(4),
-        " Go to ",
+        " All conversations and terminals ",
         Style::default().fg(p.accent).bg(p.panel_bg),
     );
     let rows = super::aggregate_navigation::navigator_rows(endpoints, active_endpoint_id, n);
@@ -744,22 +785,38 @@ fn render_navigator_overlay(
             }
         )
     } else if n.query.is_empty() {
-        " / search agents and terminals".to_owned()
+        " / search all conversations and terminals".to_owned()
     } else {
         format!(" / {}", n.query)
     };
     let terminal_count = rows
         .iter()
-        .filter(|row| matches!(row.target, ClientNavigatorTarget::Pane { .. }))
+        .filter(|row| {
+            matches!(
+                row.target,
+                ClientNavigatorTarget::Pane { .. } | ClientNavigatorTarget::Conversation { .. }
+            )
+        })
         .count();
-    let count = format!(
+    let mut count = format!(
         "{terminal_count} {}",
-        if terminal_count == 1 {
-            "terminal"
-        } else {
-            "terminals"
-        }
+        if terminal_count == 1 { "item" } else { "items" }
     );
+    if endpoints.iter().any(|endpoint| {
+        endpoint
+            .conversations
+            .as_ref()
+            .is_some_and(|cache| cache.projection.recovery_error.is_some())
+    }) {
+        count.push_str(" · history unavailable");
+    } else if endpoints.iter().any(|endpoint| {
+        endpoint
+            .conversations
+            .as_ref()
+            .is_some_and(|cache| cache.projection.next_offset.is_some())
+    }) {
+        count.push_str(" · loading history");
+    }
     put_text(
         b,
         i.x,
@@ -823,7 +880,7 @@ fn render_navigator_overlay(
             body.x,
             body.y,
             body.width,
-            " No matching agents or terminals",
+            " No matching conversations or terminals",
             Style::default().fg(p.overlay0).bg(p.panel_bg),
         );
     }
@@ -860,13 +917,18 @@ fn render_navigator_overlay(
                 )
                 .bg(p.panel_bg)
         };
-        let is_pane = matches!(r.target, ClientNavigatorTarget::Pane { .. });
+        let is_pane = matches!(
+            r.target,
+            ClientNavigatorTarget::Pane { .. } | ClientNavigatorTarget::Conversation { .. }
+        );
         let connector = if !is_pane {
             ""
-        } else if rows
-            .get(ix + 1)
-            .is_some_and(|next| matches!(next.target, ClientNavigatorTarget::Pane { .. }))
-        {
+        } else if rows.get(ix + 1).is_some_and(|next| {
+            matches!(
+                next.target,
+                ClientNavigatorTarget::Pane { .. } | ClientNavigatorTarget::Conversation { .. }
+            )
+        }) {
             "├─ "
         } else {
             "└─ "

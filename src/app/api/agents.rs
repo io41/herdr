@@ -12,6 +12,13 @@ use super::responses::{encode_error, encode_error_body, encode_success};
 
 const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 
+type SubmittedAgentPrompt = (
+    String,
+    crate::api::schema::AgentInfo,
+    std::sync::mpsc::Receiver<std::io::Result<()>>,
+    Option<String>,
+);
+
 // Codex's Windows input reader does not surface bracketed paste. It detects the prompt as a
 // "paste burst" and, while that burst is buffered, rewrites a following Enter into a newline
 // instead of submitting. The burst only flushes after an idle timeout, so any size-based delay is
@@ -87,6 +94,7 @@ impl App {
         let crate::api::schema::Method::AgentPrompt(params) = request.method else {
             return false;
         };
+        self.sync_agent_conversations();
         let validated = match self.validate_agent_prompt(request.id, &params) {
             Ok(validated) => validated,
             Err(response) => {
@@ -96,18 +104,38 @@ impl App {
         };
         // Start the completion waiter before submitting, so a refused thread
         // fails the request while nothing has been sent yet.
-        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<(
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        )>();
+        let (handoff_tx, handoff_rx) = std::sync::mpsc::channel::<SubmittedAgentPrompt>();
         let waiter_respond_to = respond_to.clone();
+        let event_tx = self.event_tx.clone();
         let spawned = crate::thread_spawn::spawn_named("herdr-agent-prompt", move || {
-            let Ok((id, agent, completion)) = handoff_rx.recv() else {
+            let Ok((id, agent, completion, conversation_id)) = handoff_rx.recv() else {
                 return;
             };
-            let response = match completion.recv() {
-                Ok(Ok(())) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+            let completion_result = completion.recv();
+            let lifecycle_result = if let Some(conversation_id) = conversation_id {
+                let (acknowledge, ack_rx) = std::sync::mpsc::channel();
+                if event_tx
+                    .blocking_send(crate::events::AppEvent::AgentConversationPromptCompleted {
+                        conversation_id,
+                        submitted: matches!(&completion_result, Ok(Ok(()))),
+                        acknowledge,
+                    })
+                    .is_err()
+                {
+                    Err("server stopped before recording prompt submission".into())
+                } else {
+                    ack_rx.recv().unwrap_or_else(|_| {
+                        Err("server stopped before recording prompt submission".into())
+                    })
+                }
+            } else {
+                Ok(())
+            };
+            let response = match completion_result {
+                Ok(Ok(())) => match lifecycle_result {
+                    Ok(()) => encode_success(id, ResponseResult::AgentPrompted { agent }),
+                    Err(error) => encode_error(id, "agent_prompt_submitted_lifecycle_failed", format!("Prompt was submitted; conversation history could not be saved. Do not resend the prompt. {error}")),
+                },
                 Ok(Err(err)) if err.kind() == std::io::ErrorKind::TimedOut => {
                     encode_error(id, "timeout", err.to_string())
                 }
@@ -210,14 +238,7 @@ impl App {
         &mut self,
         validated: ValidatedAgentPrompt,
         params: &AgentPromptParams,
-    ) -> Result<
-        (
-            String,
-            crate::api::schema::AgentInfo,
-            std::sync::mpsc::Receiver<std::io::Result<()>>,
-        ),
-        String,
-    > {
+    ) -> Result<SubmittedAgentPrompt, String> {
         let ValidatedAgentPrompt {
             id,
             ws_idx,
@@ -265,7 +286,15 @@ impl App {
                 submit_deadline,
             )
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
-        Ok((id, agent, completion))
+        let conversation_id = self.conversation_id_for_pane(pane_id);
+        if let Some(conversation_id) = &conversation_id {
+            *self
+                .pending_conversation_prompts
+                .entry(conversation_id.clone())
+                .or_default() += 1;
+            self.sync_agent_conversations();
+        }
+        Ok((id, agent, completion, conversation_id))
     }
 
     pub(super) fn handle_agent_read(
@@ -495,9 +524,24 @@ mod tests {
     }
 
     fn run_deferred_agent_prompt(app: &mut App, id: &str, params: AgentPromptParams) -> String {
-        start_deferred_agent_prompt(app, id, params)
-            .recv_timeout(Duration::from_secs(1))
-            .expect("agent prompt responds after submission")
+        let response_rx = start_deferred_agent_prompt(app, id, params);
+        receive_deferred_agent_prompt(app, response_rx)
+    }
+
+    fn receive_deferred_agent_prompt(
+        app: &mut App,
+        response_rx: std::sync::mpsc::Receiver<String>,
+    ) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            app.drain_all_internal_events();
+            match response_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(response) => return response,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if std::time::Instant::now() < deadline => {}
+                error => panic!("agent prompt did not respond after submission: {error:?}"),
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -624,9 +668,7 @@ mod tests {
             },
         );
         assert!(response_rx.try_recv().is_err());
-        let response = response_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("agent prompt responds after submission");
+        let response = receive_deferred_agent_prompt(&mut app, response_rx);
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         let ResponseResult::AgentPrompted { agent, .. } = success.result else {
             panic!("expected prompted response");
@@ -670,6 +712,45 @@ mod tests {
         let error: crate::api::schema::ErrorResponse = serde_json::from_str(&rejected).unwrap();
         assert_eq!(error.error.code, "agent_not_found");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_reports_submitted_when_lifecycle_persistence_fails() {
+        let mut app = app_with_agent();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into());
+        terminal.set_detected_state(Some(Agent::OpenCode), AgentState::Working);
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.insert_test_runtime(pane_id, runtime);
+        let path = std::env::temp_dir().join(format!(
+            "herdr-prompt-corrupt-{}",
+            crate::terminal::TerminalId::alloc()
+        ));
+        std::fs::write(&path, b"invalid registry").unwrap();
+        app.agent_inbox = crate::agent_inbox::InboxRegistry::load(
+            Some(path.clone()),
+            app.agent_inbox_boot_id.clone(),
+        );
+        let response = run_deferred_agent_prompt(
+            &mut app,
+            "submitted",
+            AgentPromptParams {
+                target: "reviewer".into(),
+                text: "hello".into(),
+                wait: None,
+            },
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "agent_prompt_submitted_lifecycle_failed");
+        assert!(error.error.message.contains("Do not resend the prompt"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"hello"));
+        assert_eq!(rx.try_recv().unwrap(), Bytes::from_static(b"\r"));
+        assert!(rx.try_recv().is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

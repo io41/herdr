@@ -50,6 +50,10 @@ pub struct TabHistorySnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
+    #[serde(default)]
+    pub tab_location_ids: Vec<String>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -165,6 +169,8 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         };
 
         Self {
+            location_id: None,
+            tab_location_ids: Vec::new(),
             id: None,
             custom_name: snap.custom_name,
             identity_cwd,
@@ -303,6 +309,8 @@ fn capture_workspace(
         .map(|pane| pane.cwd.clone())
         .unwrap_or_else(|| ws.identity_cwd.clone());
     WorkspaceSnapshot {
+        location_id: Some(ws.location_id.clone()),
+        tab_location_ids: ws.tabs.iter().map(|tab| tab.location_id.clone()).collect(),
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
         identity_cwd,
@@ -724,6 +732,8 @@ mod tests {
 
         let snap = SessionSnapshot {
             workspaces: vec![WorkspaceSnapshot {
+                location_id: None,
+                tab_location_ids: Vec::new(),
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
@@ -873,6 +883,36 @@ mod tests {
         assert_eq!(ws.tabs[0].root_pane, Some(0));
         assert_eq!(ws.tabs[0].panes[&0].cwd, PathBuf::from("/tmp/pion"));
         assert_eq!(ws.tabs[0].panes[&1].cwd, PathBuf::from("/tmp/herdr"));
+    }
+
+    #[test]
+    fn capture_preserves_durable_locations_separate_from_public_ids() {
+        let state = state_with_workspaces(&["one", "two"]);
+        let snapshot = capture_from_state(&state);
+        for (workspace, saved) in state.workspaces.iter().zip(&snapshot.workspaces) {
+            assert_eq!(
+                saved.location_id.as_deref(),
+                Some(workspace.location_id.as_str())
+            );
+            assert_eq!(
+                saved.tab_location_ids,
+                workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.location_id.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        let restored: SessionSnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            restored.workspaces[0].location_id,
+            snapshot.workspaces[0].location_id
+        );
+        assert_eq!(
+            restored.workspaces[0].tab_location_ids,
+            snapshot.workspaces[0].tab_location_ids
+        );
     }
 
     #[test]
@@ -1425,6 +1465,8 @@ mod tests {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                location_id: None,
+                tab_location_ids: Vec::new(),
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),

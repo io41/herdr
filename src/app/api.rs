@@ -90,6 +90,16 @@ impl App {
         &mut self,
         ev: AppEvent,
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
+        if let AppEvent::AgentConversationPromptCompleted {
+            conversation_id,
+            submitted,
+            acknowledge,
+        } = ev
+        {
+            let result = self.finish_conversation_prompt(&conversation_id, submitted);
+            let _ = acknowledge.send(result);
+            return Vec::new();
+        }
         let mut worktree_restore_failed = false;
         let ev = match ev {
             AppEvent::WorktreeRuntimeRestoreFailed {
@@ -107,6 +117,15 @@ impl App {
             }
             ev => ev,
         };
+        if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            if let Some(terminal_id) = self
+                .find_pane(*pane_id)
+                .map(|(_, pane)| pane.attached_terminal_id.to_string())
+            {
+                self.fail_agent_conversation_resume_for_terminal(&terminal_id);
+                self.sync_agent_inbox_deadline();
+            }
+        }
         if matches!(
             &ev,
             AppEvent::TerminalBell { .. } | AppEvent::ClipboardWrite { .. }
@@ -305,6 +324,9 @@ impl App {
             None
         };
 
+        if matches!(&ev, AppEvent::PaneDied { .. }) {
+            self.sync_agent_conversations();
+        }
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
                 if let Some(public_pane_id) = self.public_pane_id(ws_idx, *pane_id) {
@@ -388,6 +410,7 @@ impl App {
             self.emit_pane_state_update(update);
         }
         self.sync_agent_metadata_deadline();
+        self.sync_agent_conversations();
         if let Some((
             overlay,
             was_overlay_active,
@@ -936,6 +959,23 @@ impl App {
         &mut self,
         request: crate::api::schema::Request,
     ) -> String {
+        let changes_runtime = request.method.operation().changes_ui;
+        if changes_runtime
+            || matches!(
+                &request.method,
+                crate::api::schema::Method::AgentConversationList(_)
+            )
+        {
+            self.sync_agent_conversations();
+        }
+        let response = self.dispatch_api_request(request);
+        if changes_runtime {
+            self.sync_agent_conversations();
+        }
+        response
+    }
+
+    fn dispatch_api_request(&mut self, request: crate::api::schema::Request) -> String {
         self.sync_pending_terminal_titles();
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
@@ -1115,6 +1155,29 @@ impl App {
             Method::TabRename(params) => return self.handle_tab_rename(request.id, params),
             Method::TabMove(params) => return self.handle_tab_move(request.id, params),
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
+            Method::AgentConversationOpen(params) => {
+                return self.handle_agent_conversation_open(request.id, params)
+            }
+            Method::AgentConversationList(params) => {
+                return self.handle_agent_conversation_list(request.id, params)
+            }
+            Method::AgentConversationSettle(params) => {
+                return self.handle_agent_conversation_mutation(
+                    request.id,
+                    params,
+                    crate::agent_inbox::ConversationAction::Settle,
+                )
+            }
+            Method::AgentConversationReopen(params) => {
+                return self.handle_agent_conversation_mutation(
+                    request.id,
+                    params,
+                    crate::agent_inbox::ConversationAction::Reopen,
+                )
+            }
+            Method::AgentConversationResume(params) => {
+                return self.handle_agent_conversation_resume(request.id, params)
+            }
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),

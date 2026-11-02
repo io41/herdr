@@ -55,6 +55,7 @@ impl ClientShellState {
                     == Some(ClientEndpointStatus::Online)
         });
         let mut render_state = render::ShellRenderState {
+            agent_inbox: self.agent_inbox,
             machine_diagnostics: &self.machine_diagnostics,
             endpoints: &self.endpoints,
             active_endpoint_id: &self.active_endpoint_id,
@@ -97,6 +98,18 @@ impl ClientShellState {
                 &mut self.hits,
             );
         }
+        super::agent_inbox::render_conversation_panel(
+            &mut buffer,
+            &self.endpoints,
+            self.agent_inbox,
+            self.agent_inbox_expanded,
+            self.agent_inbox_selected.as_ref(),
+            &self.conversation_read,
+            self.sidebar_collapsed,
+            &self.config,
+            &mut self.agent_scroll,
+            &mut self.hits,
+        );
         if !self.config.mouse_capture {
             self.hits = ShellHitMap::default();
         }
@@ -144,7 +157,58 @@ impl ClientShellState {
                 &self.config.palette,
             );
         }
-        FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
+        let rendered_overlay = self.overlay.as_ref().and_then(|overlay| {
+            if let ClientShellOverlay::ContextMenu(menu) = overlay {
+                render::render_context_menu(&mut buffer, menu, &self.config.palette)
+            } else {
+                let snapshot = self.snapshot.as_deref().or_else(|| {
+                    self.endpoints
+                        .iter()
+                        .find_map(|endpoint| endpoint.snapshot.as_deref())
+                })?;
+                match overlay {
+                    ClientShellOverlay::GlobalMenu(menu) => render::render_global_menu(
+                        &mut buffer,
+                        self.hits.global_launcher,
+                        menu,
+                        snapshot,
+                        &self.config.palette,
+                    ),
+                    ClientShellOverlay::Navigator(_)
+                    | ClientShellOverlay::Rename(ClientRenameOverlay {
+                        target: ClientRenameTarget::ConversationCwd { .. },
+                        ..
+                    }) => render::render_client_overlay(
+                        &mut buffer,
+                        overlay,
+                        snapshot,
+                        &self.endpoints,
+                        &self.active_endpoint_id,
+                        &self.config.keybinds,
+                        &self.config.palette,
+                    ),
+                    _ => None,
+                }
+            }
+        });
+        let cursor = if let Some(rendered) = rendered_overlay {
+            if matches!(self.overlay, Some(ClientShellOverlay::ContextMenu(_))) {
+                self.hits.context_menu_rows = rendered.menu_rows;
+            } else if matches!(self.overlay, Some(ClientShellOverlay::GlobalMenu(_))) {
+                self.hits.global_menu_rows = rendered.menu_rows;
+            }
+            self.hits.overlay_primary = rendered.primary;
+            self.hits.overlay_cancel = rendered.cancel;
+            self.hits.navigator_popup = rendered.navigator_popup;
+            self.hits.navigator_search = rendered.navigator_search;
+            self.hits.navigator_rows = rendered.navigator_rows;
+            self.hits.navigator_scrollbar = rendered.navigator_scrollbar;
+            self.hits.navigator_scroll_metrics = rendered.navigator_scroll_metrics;
+            rendered.cursor
+        } else {
+            None
+        };
+        FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, cursor, &[])
     }
 
     pub(crate) fn compose(
@@ -211,6 +275,7 @@ impl ClientShellState {
             snapshot,
             &self.config,
             render::ShellRenderState {
+                agent_inbox: self.agent_inbox,
                 machine_diagnostics: &self.machine_diagnostics,
                 endpoints: &self.endpoints,
                 active_endpoint_id: &self.active_endpoint_id,
@@ -234,6 +299,18 @@ impl ClientShellState {
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
             },
+        );
+        super::agent_inbox::render_conversation_panel(
+            &mut buffer,
+            &self.endpoints,
+            self.agent_inbox,
+            self.agent_inbox_expanded,
+            self.agent_inbox_selected.as_ref(),
+            &self.conversation_read,
+            self.sidebar_collapsed,
+            &self.config,
+            &mut self.agent_scroll,
+            &mut self.hits,
         );
         self.hits.panes = surface
             .panes
@@ -600,6 +677,17 @@ impl ClientShellState {
         {
             let mut composed = frame.to_ratatui_buffer()?;
             occlusion.cover(composed.area);
+            let conversation_rows = self
+                .agent_inbox
+                .then(|| super::agent_inbox::conversation_rows(&self.endpoints));
+            let inbox = conversation_rows
+                .as_deref()
+                .map(|rows| super::mobile::MobileInbox {
+                    rows,
+                    expanded: self.agent_inbox_expanded,
+                    selected: self.agent_inbox_selected.as_ref(),
+                    read: &self.conversation_read,
+                });
             super::mobile::render_mobile_switcher(
                 &mut composed,
                 Rect::new(0, 0, cols, rows),
@@ -607,6 +695,7 @@ impl ClientShellState {
                 &self.endpoints,
                 &self.active_endpoint_id,
                 &self.config,
+                inbox,
                 self.navigate_workspace_id
                     .as_ref()
                     .filter(|_| valid_navigation_target),

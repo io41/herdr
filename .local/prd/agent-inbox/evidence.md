@@ -1,6 +1,6 @@
 # Evidence and feasibility
 
-Research began November 1, 2026 and was rechecked November 2. Herdr upstream HEAD and this branch's base are `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`. The local executable reported 0.9.5 on November 2. An earlier observation of 0.8.0 is historical, not the current installed baseline. Running client and server versions still require an authorized live inspection.
+Research began November 1, 2026 and was rechecked November 2. The historical upstream source used for research is `ee5bfb5041bb3e4a49d591c72308aae3c81ecdde`. The local executable reported 0.9.5 on November 2. An earlier observation of 0.8.0 is historical, not the current installed baseline. Running client and server versions still require an authorized live inspection.
 
 ## Why this requires a core change
 
@@ -31,3 +31,19 @@ The reference guide and server disagree about whether pins prevent automatic set
 - Approval, question, failure, human submission, and awaited autonomous work need provider-specific evidence. Do not infer them from process existence or incidental terminal text. Unsupported signals remain explicit implementation blockers for the affected automatic behavior, not permission to fabricate status.
 
 The recovered work inspected source and existing tests. It did not run those tests, install a plugin, build a patch, or verify sidebar parity live. A T3 desktop inspection attempt on November 2 timed out. Implementers must complete the acceptance work rather than treating these research findings as runtime proof.
+
+## Implementation verification
+
+The implementation worktree is `~/Code/gh/herdr-worktrees/agent-inbox` on `feat/agent-inbox`, based on `d537a0906f5b0ced4a1014d0ab1c1eef5507c883`. The implementation is reviewed in the isolated worktree and delivered through its branch history. The existing installed binary, running user session, and global agent configuration are not replaced by the side-by-side test installation.
+
+Final validation uses the repository-pinned Rust 1.96.1 and Zig 0.16.0 in a temporary task directory. The earlier baseline suite used Homebrew Rust 1.99 with Zig 0.16.0, so the full-suite comparison is not compiler-controlled. The Homebrew compiler versions do not match this checkout's pins.
+
+- Formatting and Clippy with warnings denied pass. The final targeted run passes 473 tests covering the complete client surface, lifecycle, resume, native identity, API schema, and protocol compatibility. Frozen generation-1 fixtures remain unchanged.
+- The unchanged baseline runs 3,932 tests: 3,867 pass and 65 fail. The complete integration run has 3,929 passing tests and 64 failures out of 3,993. Of those failures, 61 also fail on the baseline. The other three exposed menu and narrow-layout regressions; their fixes pass the final 473-test rerun. This is not a clean full-suite result.
+- Six architecture tests, the integration asset checks, and documentation contract checks pass. Python and Bun maintenance checks are blocked by this account's inability to create files under `/var/tmp`. Windows cross-validation is blocked by the missing SDK configuration.
+- The enabled inbox renderer at fixed 120×40 geometry measures 89,381 ns per frame with one pane and 99,713 ns with fifteen panes, a 1.12× ratio. The broader render benchmark passes six profiles. Its native-graphics profile fails an assertion that also reproduces on the unchanged baseline.
+- Real Codex 0.166.0 checks pass working, completion grace, Inbox return, explicit settlement, viewing without reopening, closed history, restart persistence, revision conflicts, and missing-location recovery. The resumed CLI loads the same transcript. Codex emits SessionStart on the next user turn; a deliberate test prompt then confirms the same native session and reopens the original conversation. The product never submits a prompt automatically to obtain that signal.
+
+An isolated actual TUI check also passes: Inbox, Working, Settled, and a closed conversation received through the optional server companion render in the client. The test client and server are stopped. Artifacts remain under `/private/tmp/herdr-inbox-tui-1793626200/`.
+
+Detailed command output remains under `/private/tmp/herdr-toolchain/`. The real-provider acceptance artifacts are under `/private/tmp/herdr-inbox-resume-turn-1793625829/`. The local decision trail is `.local/prd/agent-inbox/decisions.tsv` and remains outside the tracked change.

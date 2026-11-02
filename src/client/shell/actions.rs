@@ -169,7 +169,9 @@ impl ClientShellState {
                     }
                     return;
                 }
-                if self.handle_endpoint_navigation(action, outcome) {
+                if self.handle_conversation_navigation(action, outcome)
+                    || self.handle_endpoint_navigation(action, outcome)
+                {
                     return;
                 }
                 if let Some(method) = self.endpoint_method_for_action(action) {
@@ -505,6 +507,31 @@ impl ClientShellState {
         let Some(pending) = self.pending_requests.remove(request_id) else {
             return (false, Vec::new());
         };
+        if let PendingEndpointKind::ConversationList {
+            endpoint_id,
+            generation,
+            revision,
+            offset,
+        } = &pending.kind
+        {
+            if pending.boot_id != boot_id {
+                return (false, Vec::new());
+            }
+            return self.complete_conversation_page(
+                endpoint_id.clone(),
+                *generation,
+                *revision,
+                *offset,
+                boot_id,
+                result,
+            );
+        }
+        if let PendingEndpointKind::Conversation { endpoint_id } = &pending.kind {
+            if pending.boot_id != boot_id {
+                return (false, Vec::new());
+            }
+            return self.complete_conversation_method(endpoint_id.clone(), boot_id, result);
+        }
         if pending.boot_id != boot_id
             || self
                 .snapshot
@@ -567,6 +594,8 @@ impl ClientShellState {
             }
         }
         match pending.kind {
+            PendingEndpointKind::Conversation { .. }
+            | PendingEndpointKind::ConversationList { .. } => unreachable!("handled above"),
             PendingEndpointKind::Generic => {}
             PendingEndpointKind::PaneLinkResolve { .. } => unreachable!("handled above"),
             PendingEndpointKind::ProductAnnouncementDismiss { version, id } => {

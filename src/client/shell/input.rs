@@ -995,6 +995,9 @@ impl ClientShellState {
                 })
                 .is_some(),
             KeybindMatch::Action(KeybindAction::FocusAgent(index)) => {
+                if self.agent_inbox {
+                    return self.visible_conversations().get(*index).is_some();
+                }
                 super::aggregate_navigation::online_agent_targets(
                     &self.endpoints,
                     &self.active_endpoint_id,

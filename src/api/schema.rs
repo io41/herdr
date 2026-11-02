@@ -79,6 +79,11 @@ operations::define_operations! {
     TabMove(TabMoveParams) => "tab.move", true, true;
     TabClose(TabTarget) => "tab.close", true, true;
     AgentList(EmptyParams) => "agent.list", false, false;
+    AgentConversationOpen(AgentConversationOpenParams) => "agent.conversation.open", true, true;
+    AgentConversationList(AgentConversationListParams) => "agent.conversation.list", false, true;
+    AgentConversationSettle(AgentConversationMutationParams) => "agent.conversation.settle", true, true;
+    AgentConversationReopen(AgentConversationMutationParams) => "agent.conversation.reopen", true, true;
+    AgentConversationResume(AgentConversationResumeParams) => "agent.conversation.resume", true, true;
     AgentGet(AgentTarget) => "agent.get", false, false;
     AgentRead(AgentReadParams) => "agent.read", false, false;
     AgentExplain(AgentTarget) => "agent.explain", false, false;

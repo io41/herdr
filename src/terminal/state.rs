@@ -137,6 +137,7 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    provider_reported_session: Option<crate::agent_resume::PersistedAgentSession>,
     reported_resume: Option<crate::agent_resume::ReportedAgentResume>,
     reported_resume_revision: u64,
     pub terminal_title: Option<String>,
@@ -177,6 +178,7 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
+            provider_reported_session: None,
             reported_resume: None,
             reported_resume_revision: 0,
             terminal_title: None,
@@ -447,6 +449,7 @@ impl TerminalState {
         self.fallback_visible_blocker = visible_blocker && fallback_state == AgentState::Blocked;
         self.fallback_observed_at = Some(now);
         if process_exited {
+            self.provider_reported_session = None;
             if let Some(agent) = agent {
                 self.recent_agent_process_exit = Some(RecentAgentProcessExit {
                     agent,
@@ -557,6 +560,7 @@ impl TerminalState {
                     })
             {
                 self.persisted_agent_session = None;
+                self.provider_reported_session = None;
             }
             if !newer_custom_authority
                 && agent.is_some()
@@ -743,6 +747,8 @@ impl TerminalState {
         if owner_conflicts && !foreground_takeover_allowed {
             return None;
         }
+        // Sticky launch identity can replace a conflicting report; that is not resume confirmation.
+        let reported_session_ref = session_ref.clone();
         let session_ref = session_ref.map(|session_ref| {
             if self.lifecycle_hook_report_replaces_persisted_session(
                 &source,
@@ -792,6 +798,13 @@ impl TerminalState {
             }
         }
         self.persisted_agent_session = None;
+        self.provider_reported_session = reported_session_ref
+            .filter(|reported| Some(reported) == session_ref.as_ref())
+            .map(|session_ref| crate::agent_resume::PersistedAgentSession {
+                source: source.clone(),
+                agent: agent_label.clone(),
+                session_ref,
+            });
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
@@ -1433,10 +1446,25 @@ impl TerminalState {
             == ("herdr:opencode", "opencode", Some("select"), None)
     }
 
+    /// Current identity accepted from a provider report, never from launch or restore metadata.
+    pub(crate) fn provider_reported_session(
+        &self,
+    ) -> Option<&crate::agent_resume::PersistedAgentSession> {
+        self.provider_reported_session.as_ref().filter(|reported| {
+            self.persisted_agent_session.as_ref() == Some(*reported)
+                || self.hook_authority.as_ref().is_some_and(|authority| {
+                    authority.source == reported.source
+                        && authority.agent_label == reported.agent
+                        && authority.session_ref.as_ref() == Some(&reported.session_ref)
+                })
+        })
+    }
+
     pub fn set_persisted_agent_session(
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        self.provider_reported_session = None;
         self.persisted_agent_session = Some(session);
     }
 
@@ -1444,6 +1472,7 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        self.provider_reported_session = None;
         self.persisted_agent_session = Some(session.clone());
         self.managed_agent_launch_session = Some(session);
     }
@@ -1676,6 +1705,7 @@ impl TerminalState {
         if self.managed_agent_launch_session.as_ref() == Some(&persisted_session) {
             self.managed_agent_launch_session = None;
         }
+        self.provider_reported_session = Some(persisted_session.clone());
         self.persisted_agent_session = Some(persisted_session);
         let current_session = self.current_session_identity_for_persistence();
         if previous_session.is_some() && previous_session != current_session {
@@ -1795,6 +1825,7 @@ impl TerminalState {
             self.forget_reported_resume_of(&authority.source, &authority.agent_label);
         }
         self.persisted_agent_session = None;
+        self.provider_reported_session = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1859,6 +1890,7 @@ impl TerminalState {
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
+            self.provider_reported_session = None;
         }
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
@@ -2143,6 +2175,7 @@ impl TerminalState {
         timeout: Duration,
     ) {
         self.codex_prompt_ready = false;
+        self.provider_reported_session = None;
         self.set_agent_name(name);
         self.agent_process_acquisition_pending = true;
         self.agent_name_owner = Some(AgentNameOwner {
@@ -2318,6 +2351,7 @@ impl TerminalState {
             .is_some_and(|session| self.persisted_agent_session.as_ref() == Some(session))
         {
             self.persisted_agent_session = None;
+            self.provider_reported_session = None;
         }
         self.agent_name = None;
         self.agent_name_owner = None;
@@ -2331,6 +2365,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.provider_reported_session = None;
         self.agent_metadata.clear();
         self.metadata_report_agents.clear();
         self.suppressed_full_lifecycle_hook_reports.clear();

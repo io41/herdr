@@ -63,6 +63,11 @@ pub(super) struct ClientShellLayout {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ClientMobileTarget {
+    InboxSection(usize),
+    Conversation {
+        endpoint_id: ClientEndpointId,
+        conversation_id: String,
+    },
     Machine(ClientEndpointId),
     NewWorkspace,
     Workspace {
@@ -100,6 +105,9 @@ pub(super) struct ShellHitMap {
     pub(super) agent_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) agent_max_scroll: usize,
     pub(super) agent_sort_toggle: Rect,
+    pub(super) agent_inbox_toggle: Rect,
+    pub(super) agent_inbox_sections: Vec<(Rect, usize)>,
+    pub(super) conversations: Vec<(Rect, ClientEndpointId, String)>,
     pub(super) sidebar_divider: Rect,
     pub(super) sidebar_section_divider: Rect,
     pub(super) sidebar_toggle: Rect,
@@ -295,6 +303,10 @@ pub(super) enum ClientShellOverlayKind {
 
 #[derive(Debug)]
 pub(super) enum ClientRenameTarget {
+    ConversationCwd {
+        endpoint_id: ClientEndpointId,
+        record: Box<crate::agent_inbox::ConversationRecord>,
+    },
     NewWorkspace {
         source_workspace_id: Option<String>,
         cwd: Option<String>,
@@ -334,6 +346,10 @@ pub(super) enum ClientNavigatorFilter {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ClientNavigatorTarget {
+    Conversation {
+        endpoint_id: ClientEndpointId,
+        conversation_id: String,
+    },
     Machine {
         endpoint_id: ClientEndpointId,
     },
@@ -510,6 +526,15 @@ pub(super) struct ClientWorktreeRemoveOverlay {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ClientContextMenuAction {
+    ConversationOpen(usize),
+    ConversationOpenResumeTarget,
+    ConversationLocation(usize),
+    ConversationSettle,
+    ConversationReopen,
+    ConversationResume,
+    ConversationRecreateTab,
+    ConversationRecreateSpace,
+    ConversationChooseLocation,
     Rename,
     Close,
     NewWorktree,
@@ -529,6 +554,18 @@ pub(super) enum ClientContextMenuAction {
 
 #[derive(Debug)]
 pub(super) enum ClientContextMenuTarget {
+    ConversationLocations {
+        endpoint_id: ClientEndpointId,
+        record: Box<crate::agent_inbox::ConversationRecord>,
+        cwd: String,
+        locations: Vec<(String, String, String)>,
+    },
+    Conversation {
+        endpoint_id: ClientEndpointId,
+        record: Box<crate::agent_inbox::ConversationRecord>,
+        available: bool,
+        methods: HashSet<String>,
+    },
     Workspace {
         workspace_id: String,
         is_git: bool,
@@ -559,7 +596,7 @@ pub(super) struct ClientContextMenuOverlay {
 }
 
 pub(super) struct ClientContextMenuItem {
-    pub(super) label: &'static str,
+    pub(super) label: String,
     pub(super) action: ClientContextMenuAction,
 }
 
@@ -618,6 +655,15 @@ impl ClientShellOverlay {
 
 #[derive(Debug)]
 pub(super) enum PendingEndpointKind {
+    Conversation {
+        endpoint_id: ClientEndpointId,
+    },
+    ConversationList {
+        endpoint_id: ClientEndpointId,
+        generation: Option<u64>,
+        revision: u64,
+        offset: usize,
+    },
     Generic,
     ProductAnnouncementDismiss {
         version: String,
@@ -736,6 +782,7 @@ pub(crate) struct ClientSystemNotificationTarget {
 }
 
 pub(super) struct ClientPendingNotification {
+    pub(super) inbox_completion: Option<super::notification_policy::InboxCompletionEvidence>,
     pub(super) endpoint_id: ClientEndpointId,
     pub(super) event: SemanticNotification,
     pub(super) deadline: std::time::Instant,
@@ -876,6 +923,11 @@ pub(crate) struct ClientShellState {
     pub(super) sidebar_section_split: f32,
     pub(super) sidebar_section_split_manual: bool,
     pub(super) agent_panel_sort_manual: bool,
+    pub(super) agent_inbox: bool,
+    pub(super) agent_inbox_expanded: [bool; 3],
+    pub(super) agent_inbox_selected: Option<(ClientEndpointId, String)>,
+    pub(super) conversation_actions: Vec<ClientShellAction>,
+    pub(super) conversation_read: HashMap<String, u64>,
     pub(super) last_sidebar_divider_click: Option<std::time::Instant>,
     pub(super) chrome_drag: Option<ClientChromeDrag>,
     pub(super) workspace_press: Option<ClientWorkspacePress>,
@@ -1050,6 +1102,13 @@ impl ClientShellState {
             sidebar_section_split,
             sidebar_section_split_manual: preferences.sidebar_section_split.is_some(),
             agent_panel_sort_manual: preferences.agent_panel_sort.is_some(),
+            agent_inbox: preferences.agent_inbox,
+            agent_inbox_expanded: preferences
+                .agent_inbox_expanded
+                .unwrap_or([true, false, false]),
+            agent_inbox_selected: None,
+            conversation_actions: Vec::new(),
+            conversation_read: preferences.conversation_read,
             last_sidebar_divider_click: None,
             chrome_drag: None,
             workspace_press: None,

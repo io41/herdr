@@ -1,6 +1,6 @@
 # Agent inbox design
 
-All types, methods, and module names proposed here are design targets, not existing APIs. Revalidate source locations against the implementation base before coding.
+The type sketches below describe the behavior contract. First-delivery conversation methods are implemented; pins, snooze, and undo remain design targets. Revalidate source locations against the implementation before changing it.
 
 ## State ownership
 
@@ -36,7 +36,7 @@ One lifecycle record belongs to a conversation, even with multiple attachments. 
 
 ## Commands and concurrency
 
-Proposed neutral methods are `agent.conversation.settle`, `agent.conversation.reopen`, and, in the second delivery, `agent.conversation.snooze`, `agent.conversation.wake`, and `agent.conversation.pin`.
+First-delivery neutral methods are `agent.conversation.list`, `agent.conversation.open`, `agent.conversation.settle`, `agent.conversation.reopen`, and `agent.conversation.resume`, and the second delivery proposes `agent.conversation.snooze`, `agent.conversation.wake`, and `agent.conversation.pin`.
 
 Every mutation carries conversation identity and an expected revision. The server checks eligibility, applies the change, persists it atomically, then emits the updated projection. Failed persistence must not report success. A stale revision returns a conflict with current state. On a repeated command, check the requested postcondition first: if it already holds, return the current state without changing timestamps or revision. Otherwise enforce the revision check. This makes retries converge without overwriting intervening changes.
 
@@ -48,7 +48,7 @@ Every mutation carries conversation identity and an expected revision. The serve
 | New blocking request or failure | Bypass grace. Return to Inbox and record attention time. Clear snooze when the event is fresh and authoritative. |
 | View result | Acknowledge read state only. |
 | Settle | If eligible, persist Settled and clear pin or snooze. Keep the pane and conversation. |
-| Un-settle or Wake | Persist Inbox and update attention time. Existing active execution projects to Working. |
+| Reopen or Wake | Persist Inbox and update attention time. Existing active execution projects to Working. |
 | Snooze | Clear the pin, persist the absolute deadline, and preserve execution. Undo retains the prior pin position in its revision-checked snapshot. |
 | Snooze deadline | Apply Wake once if the stored deadline and revision still match. |
 | Disconnect or uncertain status | Preserve disposition and expose an unavailable or uncertain recovery row. |
@@ -70,3 +70,11 @@ Generation-1 named endpoint codecs are frozen. Do not append fields or enum vari
 An older endpoint disables unsupported actions and retains flat navigation. One endpoint's failure must not disconnect other endpoints. Scope presentation preferences by client and lifecycle keys by endpoint.
 
 Compute the projection once for rendering and navigation. Keep filesystem access, process inspection, snapshot formatting, and durable writes out of pane-scaled render loops. Reuse the repository's pure view and rendering boundaries. Measure fixed geometry with one and at least fifteen populated panes before enabling the feature.
+
+## Durable history and explicit resume
+
+Keep authoritative conversation records after pane closure. Save the owning endpoint, native provider session, directory, and durable Space and tab identities. Names and public positions are display context, not proof that the original destination still exists.
+
+Open inspects and never changes disposition. Reopen changes disposition without launching a process. Resume expresses explicit intent to reopen and continue the saved session. Reuse an existing attachment or reserve a single launch before creating a pane. Clear settlement after the provider reports the matching identity. A definitive failure preserves disposition. An uncertain outcome remains visible in Inbox and blocks duplicate launch until attachment reconciliation resolves it.
+
+If the saved destination no longer exists, require an explicit recreation or location choice. Validate the selected directory before starting a process. Do not recreate worktrees or substitute a new provider session. Provider capability gaps must remain visible in the client.

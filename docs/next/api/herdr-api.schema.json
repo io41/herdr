@@ -1228,6 +1228,146 @@
     },
     "request": {
       "$defs": {
+        "AgentConversationListParams": {
+          "properties": {
+            "limit": {
+              "default": 100,
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "offset": {
+              "default": 0,
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "AgentConversationMutationParams": {
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "expected_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "conversation_id",
+            "expected_revision"
+          ],
+          "type": "object"
+        },
+        "AgentConversationOpenParams": {
+          "properties": {
+            "attachment_terminal_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "conversation_id": {
+              "type": "string"
+            },
+            "expected_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "conversation_id",
+            "expected_revision"
+          ],
+          "type": "object"
+        },
+        "AgentConversationResumeLocation": {
+          "oneOf": [
+            {
+              "properties": {
+                "action": {
+                  "const": "recreate_tab",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "action": {
+                  "const": "recreate_space",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "action": {
+                  "const": "choose",
+                  "type": "string"
+                },
+                "cwd": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tab_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action",
+                "workspace_id"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "AgentConversationResumeParams": {
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "expected_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "location": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentConversationResumeLocation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "conversation_id",
+            "expected_revision"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -5249,6 +5389,86 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.settle",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationMutationParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.reopen",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationMutationParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.resume",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationResumeParams"
             }
           },
           "required": [
@@ -9489,6 +9709,68 @@
               "required": [
                 "type",
                 "agent"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "projection": true,
+                "type": {
+                  "const": "agent_conversations",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "projection"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "conversation": true,
+                "type": {
+                  "const": "agent_conversation",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "conversation"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "conversation_id": {
+                  "type": "string"
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_conversation_opened",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "conversation_id",
+                "pane_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "result": true,
+                "type": {
+                  "const": "agent_conversation_resume",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "result"
               ],
               "type": "object"
             },

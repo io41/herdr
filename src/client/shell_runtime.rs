@@ -10,6 +10,7 @@ pub(super) fn dispatch_client_shell_actions(
 ) -> Result<(Vec<crossterm::event::MouseEvent>, bool), ClientError> {
     let mut replay_mouse = Vec::new();
     let mut repaint = false;
+    let mut conversation_endpoints = std::collections::HashSet::new();
     for action in actions {
         match action {
             shell::ClientShellAction::Endpoint {
@@ -17,17 +18,29 @@ pub(super) fn dispatch_client_shell_actions(
                 boot_id,
                 request,
             } => {
+                let conversation = matches!(
+                    request.method,
+                    crate::api::schema::Method::AgentConversationList(_)
+                        | crate::api::schema::Method::AgentConversationOpen(_)
+                        | crate::api::schema::Method::AgentConversationSettle(_)
+                        | crate::api::schema::Method::AgentConversationReopen(_)
+                        | crate::api::schema::Method::AgentConversationResume(_)
+                );
                 if let Some(connection) = endpoints.connection(&endpoint_id).filter(|connection| {
-                    endpoints.active_id() == &endpoint_id
-                        && (endpoints.active_surface_available()
+                    conversation
+                        || (endpoints.active_id() == &endpoint_id
+                            && (endpoints.active_surface_available()
                             // The coherent target is visible before its input fence opens.
                             // Retain workspace navigation; sending remains gated below.
                             || (connection.surface_active
                                 && matches!(
                                     request.method,
                                     crate::api::schema::Method::WorkspaceFocus(_)
-                                )))
+                                ))))
                 }) {
+                    if conversation {
+                        conversation_endpoints.insert(endpoint_id.clone());
+                    }
                     endpoint_commands.enqueue(endpoint_id, connection.generation, boot_id, request);
                 } else if let Some(shell) = shell.as_deref_mut() {
                     repaint |= shell.cancel_endpoint_request(&request.id);
@@ -74,7 +87,15 @@ pub(super) fn dispatch_client_shell_actions(
     if endpoints.active_surface_available() {
         let active_endpoint = endpoints.active_id().clone();
         let cancelled = endpoint_commands.send_next(&active_endpoint, endpoints);
-        if let Some(shell) = shell {
+        if let Some(shell) = shell.as_deref_mut() {
+            for request_id in cancelled {
+                repaint |= shell.cancel_endpoint_request(&request_id);
+            }
+        }
+    }
+    for endpoint_id in conversation_endpoints {
+        let cancelled = endpoint_commands.send_next(&endpoint_id, endpoints);
+        if let Some(shell) = shell.as_deref_mut() {
             for request_id in cancelled {
                 repaint |= shell.cancel_endpoint_request(&request_id);
             }
@@ -869,6 +890,79 @@ pub(super) fn finish_client_shell_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_conversation_request_keeps_presentation_and_pane_commands_isolated() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<ClientMessage>>>);
+        impl endpoint::EndpointTransport for Capture {
+            fn send(&mut self, message: &ClientMessage) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok(())
+            }
+        }
+        let remote = endpoint::ClientEndpointId::Ssh(
+            endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+        );
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut endpoints = endpoint::EndpointRegistry::empty();
+        endpoints.insert(
+            remote.clone(),
+            Capture(sent.clone()),
+            2,
+            Default::default(),
+            false,
+        );
+        let mut commands = endpoint_commands::EndpointCommands::default();
+        let actions = vec![
+            shell::ClientShellAction::Endpoint {
+                endpoint_id: remote.clone(),
+                boot_id: "boot".into(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "pane-focus".into(),
+                    method: crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                        pane_id: "pane".into(),
+                    }),
+                }),
+            },
+            shell::ClientShellAction::Endpoint {
+                endpoint_id: remote.clone(),
+                boot_id: "boot".into(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "next-page".into(),
+                    method: crate::api::schema::Method::AgentConversationList(
+                        crate::api::schema::AgentConversationListParams {
+                            offset: 100,
+                            limit: 100,
+                        },
+                    ),
+                }),
+            },
+        ];
+        let mut scheduled = None;
+        let (replay, repaint) = dispatch_client_shell_actions(
+            actions,
+            &mut commands,
+            &mut endpoints,
+            None,
+            &mut Vec::new(),
+            &mut scheduled,
+        )
+        .unwrap();
+        assert!(replay.is_empty());
+        assert!(!repaint);
+        assert!(scheduled.is_none());
+        assert_eq!(endpoints.active_id(), &endpoint::ClientEndpointId::Local);
+        assert!(!endpoints.connection(&remote).unwrap().surface_active);
+        let messages = sent.lock().unwrap();
+        let [ClientMessage::ClientShellEndpointRequest { boot_id, request }] = messages.as_slice()
+        else {
+            panic!("one metadata request");
+        };
+        assert_eq!(boot_id, "boot");
+        let request: crate::api::schema::Request = serde_json::from_str(request).unwrap();
+        assert_eq!(request.id, "next-page");
+    }
 
     #[test]
     fn host_color_reaches_server_before_first_snapshot() {

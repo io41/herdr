@@ -19,6 +19,8 @@ mod creation;
 mod custom_commands;
 mod git_refresh;
 mod ids;
+mod inbox;
+mod inbox_resume;
 mod popup;
 mod runtime;
 mod session;
@@ -104,6 +106,11 @@ impl AppPolicy {
 
 pub struct App {
     pub state: AppState,
+    pub(crate) agent_inbox: crate::agent_inbox::InboxRegistry,
+    pub(crate) agent_inbox_boot_id: String,
+    pub(crate) agent_inbox_deadline: Option<Instant>,
+    pub(crate) agent_inbox_error: Option<String>,
+    pub(crate) pending_conversation_prompts: HashMap<String, usize>,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -618,7 +625,19 @@ impl App {
         let endpoint_commands =
             custom_commands::EndpointCommandRegistry::new(&state.keybinds.custom_commands);
 
+        let agent_inbox_boot_id = crate::terminal::TerminalId::alloc().to_string();
+        let agent_inbox = crate::agent_inbox::InboxRegistry::load(
+            policy
+                .persist_session
+                .then(|| crate::session::data_dir().join("agent-conversations.json")),
+            agent_inbox_boot_id.clone(),
+        );
         let mut app = Self {
+            agent_inbox,
+            agent_inbox_boot_id,
+            agent_inbox_deadline: None,
+            agent_inbox_error: None,
+            pending_conversation_prompts: HashMap::new(),
             plugin_installation_leases,
             plugin_installation_cleanup_allowed,
             config_diagnostic_deadline: None,
@@ -690,6 +709,7 @@ impl App {
             client_shell_keybindings_profile,
             endpoint_commands,
         };
+        app.sync_agent_conversations();
         app.configure_tab_bar_status(&config.ui.tab_bar_right, &config.ui.tab_bar_right_separator);
         app.configure_window_title(&config.ui.window_title);
         app.refresh_restored_workspace_git_metadata();
