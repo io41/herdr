@@ -133,7 +133,8 @@ class SwitchTests(unittest.TestCase):
         self.runtime[(session.context.label, session.name)] = api_snapshot(switch.read_json(session.directory / "session.json"))
         if entry is not None:
             entry["identity"] = self.identity(session)
-            self.current_switch.save()
+            if self.current_switch is not None:
+                self.current_switch.save()
         return self.identity(session)
 
     def create_switch(self, source=None, target=None, transaction=None):
@@ -511,6 +512,52 @@ class SwitchTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 self.assertEqual(switch.main(["to-inbox", "--apply", "--yes"]), 0)
             execute.assert_not_called()
+
+    def test_repeated_cli_switch_preserves_newer_stopped_target_without_new_transaction(self):
+        self.write(self.stable, running=True)
+        with mock.patch.object(switch, "defaults", return_value=(self.stable, self.inbox, self.backups)), mock.patch.dict(os.environ, {"HERDR_ENV": ""}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(switch.main(["to-inbox", "--apply", "--yes"]), 0)
+            target = self.inbox.session("agent-inbox")
+            (target.directory / "session.json").write_text(json.dumps(snapshot(value="newer-inbox-native-id")))
+            self.runtime.pop(("inbox", "agent-inbox"))
+            before = switch.inventory(target.directory)
+            transactions = set(self.backups.iterdir())
+            stopped = list(self.stops)
+            with self.assertRaisesRegex(switch.Refusal, "inbox is already active"):
+                switch.main(["to-inbox", "--apply", "--yes"])
+            self.assertEqual(switch.inventory(target.directory), before)
+            self.assertEqual(set(self.backups.iterdir()), transactions)
+            self.assertEqual(self.stops, stopped)
+            self.assertEqual(switch.main(["to-stable", "--apply", "--yes"]), 0)
+        self.assertEqual(switch.read_json(self.stable.session("default").directory / "session.json")["workspaces"][0]["tabs"][0]["panes"]["42"]["agent_session"]["value"], "newer-inbox-native-id")
+
+    def test_changed_stopped_source_can_start_fresh_transfer(self):
+        source = self.write(self.stable)
+        first = self.create_switch()
+        first.run()
+        (source.directory / "session.json").write_text(json.dumps(snapshot(value="reopened-source-native-id")))
+        second = self.create_switch()
+        second.run()
+        self.assertNotEqual(second.directory, first.directory)
+        self.assertEqual(switch.disk_state(self.inbox.session("agent-inbox")), switch.disk_state(source))
+
+    def test_rollback_marks_original_source_active_for_direction_guard(self):
+        self.write(self.stable)
+        self.write(self.inbox, "agent-inbox", snapshot(value="original-inbox"))
+        transaction = self.create_switch()
+        transaction.run()
+        transaction.rollback()
+        count = len(list(self.backups.iterdir()))
+        with self.assertRaisesRegex(switch.Refusal, "stable is already active"):
+            self.create_switch(self.inbox, self.stable).run()
+        self.assertEqual(len(list(self.backups.iterdir())), count)
+        self.create_switch().run()
+
+    def test_update_opt_out_survives_stable_context_and_inbox_forces_it(self):
+        with mock.patch.dict(os.environ, {"HERDR_DISABLE_UPDATES": "1"}):
+            self.assertEqual(self.stable.environment()["HERDR_DISABLE_UPDATES"], "1")
+        with mock.patch.dict(os.environ, {"HERDR_DISABLE_UPDATES": "0"}):
+            self.assertEqual(self.inbox.environment()["HERDR_DISABLE_UPDATES"], "1")
 
 
 if __name__ == "__main__":

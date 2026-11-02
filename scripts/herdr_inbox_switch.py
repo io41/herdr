@@ -212,7 +212,7 @@ class Context:
 
     def environment(self):
         env = {key: value for key, value in os.environ.items()
-               if not key.startswith("HERDR_") and key != "CODEX_THREAD_ID"}
+               if (not key.startswith("HERDR_") or key == "HERDR_DISABLE_UPDATES") and key != "CODEX_THREAD_ID"}
         env["XDG_CONFIG_HOME"] = str(self.config.parent)
         env["XDG_STATE_HOME"] = str(self.state.parent)
         env["PATH"] = str(self.binary.parent) + os.pathsep + env.get("PATH", "")
@@ -628,10 +628,43 @@ class Switch:
     def session(self, record):
         return (self.source if record["side"] == "source" else self.target).session(record["name"])
 
+    def check_direction(self, mapping):
+        if any(running(session) for session, _ in mapping) or not self.backup_root.exists():
+            return
+        completed = []
+        for directory in self.backup_root.iterdir():
+            path = checked_path(directory / "journal.json")
+            if path.is_file():
+                journal = read_json(path)
+                if journal["phase"] in ("complete", "rolled-back"):
+                    completed.append((path.stat().st_mtime_ns, directory, journal))
+        if not completed:
+            return
+        _, directory, journal = max(completed, key=lambda item: item[0])
+        previous_source = Context.from_json(journal["source"])
+        previous_target = Context.from_json(journal["target"])
+        if {previous_source, previous_target} != {self.source, self.target}:
+            raise Refusal("Previous switch contexts differ; inspect backups before switching again")
+        previous = Switch(previous_source, previous_target, self.backup_root, directory)
+        active = previous.target if journal["phase"] == "complete" else previous.source
+        if active != self.target:
+            return
+        inactive = previous.source if journal["phase"] == "complete" else previous.target
+        if inactive != self.source:
+            raise Refusal("Previous switch contexts differ; inspect backups before switching again")
+        side = "source" if journal["phase"] == "complete" else "target"
+        saved = {record["name"]: record["expected"] for record in journal["sessions"] if record["side"] == side}
+        if all(session.name in saved and content(inventory(session.directory)) == content(saved[session.name])
+               for session, _ in mapping):
+            opposite = "to-stable" if self.target.label == "inbox" else "to-inbox"
+            raise Refusal("%s is already active; stopped %s snapshots are unchanged. Use %s or inspect backups at %s before switching again."
+                          % (self.target.label, self.source.label, opposite, directory))
+
     def prepare(self):
         validate_context(self.source)
         validate_context(self.target)
         mapping, targets = plan(self.source, self.target)
+        self.check_direction(mapping)
         self.directory = self.backup_root / (time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex)
         self.directory.mkdir(parents=True, mode=0o700)
         fsync_dir(self.backup_root)
@@ -1059,12 +1092,14 @@ def main(argv=None):
     print("Local Unix sessions only; remote endpoints stay unchanged. Do not launch either app while switching.")
     print("Shutdown ends shell jobs and pane processes. Agent histories remain external/shared; agents may resume automatically.")
     print("Both profiles stop; matching destination sessions are replaced after backup. Destination-only sessions stay saved but stopped.")
+    print("This transfers the whole source profile, not just changed sessions; review every destination in the plan.")
     if transaction:
         print("Transaction:", transaction, "phase:", switch.journal["phase"])
     else:
         validate_context(source)
         validate_context(target)
         mapping, targets = plan(source, target)
+        switch.check_direction(mapping)
         for src, dst in mapping:
             print("%s %s [%s] -> %s %s" % (source.label, src.name, "running" if running(src) else "stopped", target.label, dst.name))
         print("Target sessions backed up before overwrite:", ", ".join(session.name for session in targets))

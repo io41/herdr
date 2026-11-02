@@ -63,7 +63,7 @@ Switching stops pane processes and shell jobs. Only agents with usable native se
 3. Run `herdr-inbox-switch to-inbox --apply`. Review the warning and type `to-inbox` to confirm shutdown.
 4. To return, preview with `herdr-inbox-switch to-stable`, then run `herdr-inbox-switch to-stable --apply` and type `to-stable`.
 
-The helper verifies private, SHA-256 checked backups, live versus saved topology, native references, and actual server process exit. It then transfers saved state and restarts only sessions that were running in the source profile. Previously stopped sessions stay stopped. In an interactive terminal, it attaches to a restarted default session, or the first restarted named session. It also prints attachment commands for the other sessions.
+The helper verifies private, SHA-256 checked backups, live versus saved topology, native references, and actual server process exit. It then transfers saved state and restarts only sessions that were running in the source profile. Previously stopped sessions stay stopped. Repeating a completed direction is refused when every session in the inactive source is unchanged. If any source session has changed or reopened, a new switch transfers the whole source profile, including unchanged sessions. This is replacement after backup, not a per-session merge; review every mapped destination in the preview. In an interactive terminal, it attaches to a restarted default session, or the first restarted named session. It also prints attachment commands for the other sessions.
 
 Backups and transaction journals remain under `~/.local/state/herdr-inbox-switch/backups/`. If interrupted, use the exact transaction directory printed by the command:
 
