@@ -22,7 +22,9 @@ The view selector offers Inbox, All agents by space, and All agents by attention
 
 Open focuses a live conversation without changing its settlement state. Settle saves its native session reference and last location, then closes its sole agent process and pane. It may also remove an empty tab or Space through the normal pane-close behavior. Other panes remain running. Working agents, queued input, drafts, unanswered requests, unknown state, or ambiguous duplicate attachments prevent settlement; the action shows the reason.
 
-Restore is the single action for settled or closed conversations. It reuses an existing attachment or starts the exact saved native session in a new pane, then focuses it. Herdr first matches durable location IDs, then unique existing Space and tab names. It creates only missing containers. Duplicate matching names or a missing working directory prompt for the specific missing choice rather than showing all recovery options in advance.
+Restore resumes a settled or closed conversation with one action. It reuses an existing attachment or starts the exact saved native session in a new pane, then focuses it. Herdr first matches durable location IDs, then unique existing Space and tab names. It creates only missing containers. Duplicate matching names or a missing working directory prompt for the specific missing choice rather than showing all recovery options in advance.
+
+Closed conversations still in Inbox also offer Settle. This puts away the saved conversation without restarting its agent.
 
 A new process remains unconfirmed until the provider reports the matching native session. Choose **Open restored session**, then submit your next Codex prompt to confirm the session identity. Herdr does not send a prompt automatically. An uncertain result blocks duplicate launch attempts. Herdr never silently substitutes a new conversation.
 

@@ -13,6 +13,62 @@ fn record(id: &str, section: ConversationSection, attached: bool) -> Conversatio
     })).unwrap()
 }
 
+#[test]
+fn closed_inbox_conversation_can_be_settled_without_restoring_it() {
+    let mut state = inbox(vec![record(
+        "closed-inbox",
+        ConversationSection::Inbox,
+        false,
+    )]);
+    let mut outcome = ClientShellInput::default();
+    state.open_conversation(
+        ClientEndpointId::Local,
+        "closed-inbox".into(),
+        true,
+        &mut outcome,
+    );
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!("conversation actions did not open")
+    };
+    let items = menu.items();
+    assert!(items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::ConversationResume));
+    let settle = items
+        .iter()
+        .position(|item| item.action == ClientContextMenuAction::ConversationSettle)
+        .expect("closed Inbox conversation must offer Settle");
+    state.activate_context_menu_item(settle, &mut outcome);
+    assert!(outcome.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
+            if matches!(&request.method,
+                crate::api::schema::Method::AgentConversationSettleAndClose(params)
+                    if params.conversation_id == "closed-inbox")
+    )));
+    assert!(!outcome.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
+            if matches!(&request.method,
+                crate::api::schema::Method::AgentConversationRestore(_))
+    )));
+
+    let mut settled = inbox(vec![record("settled", ConversationSection::Settled, false)]);
+    settled.open_conversation(
+        ClientEndpointId::Local,
+        "settled".into(),
+        true,
+        &mut ClientShellInput::default(),
+    );
+    let Some(ClientShellOverlay::ContextMenu(menu)) = settled.overlay.as_ref() else {
+        panic!("settled conversation actions did not open")
+    };
+    assert!(!menu
+        .items()
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::ConversationSettle));
+}
+
 fn projection(
     boot: &str,
     revision: u64,

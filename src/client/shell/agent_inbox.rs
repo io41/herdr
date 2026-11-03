@@ -1270,7 +1270,8 @@ pub(super) fn conversation_menu_items(
                 Action::Disabled
             },
         });
-    } else {
+    }
+    if record.disposition != Disposition::Settled {
         let reason = if !available {
             Some("endpoint unavailable")
         } else if !methods.contains("agent.conversation.settle_and_close") {
