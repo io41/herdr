@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent_resume::AgentSessionRef;
+use crate::agent_resume::{AgentSessionRef, PersistedAgentSession};
 
 const REGISTRY_VERSION: u64 = 1;
 const COMPLETION_GRACE_MS: u64 = 2_000;
+pub const MIN_SNOOZE_DURATION_MS: u64 = 60_000;
+pub const MAX_SNOOZE_DURATION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 pub const MAX_RECORD_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +85,8 @@ pub struct ConversationRecord {
     pub attention_returned_at_ms: u64,
     pub last_human_submission_at_ms: Option<u64>,
     pub settled_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until_ms: Option<u64>,
     #[serde(default)]
     pub completed_at_ms: Option<u64>,
     pub revision: u64,
@@ -123,6 +127,8 @@ pub enum ConversationAction {
     Settle,
     SettleAndClose,
     Reopen,
+    Snooze { wake_at_ms: u64 },
+    Wake,
     BeginResume,
     ResumeLaunched(Box<ConversationAttachment>),
     ResumeSucceeded,
@@ -224,6 +230,7 @@ impl InboxRegistry {
                 }
                 record.attachments.clear();
                 record.execution = ExecutionState::Closed;
+                record.queued_human_work = false;
                 if record.resume_state == ResumeState::Pending {
                     record.resume_state = ResumeState::Uncertain;
                 }
@@ -268,7 +275,18 @@ impl InboxRegistry {
                             .map(|started| started.saturating_add(30_000))
                     }),
             )
+            .chain(
+                self.records
+                    .values()
+                    .filter_map(|record| record.snoozed_until_ms),
+            )
             .min()
+    }
+
+    pub fn has_snoozed_conversations(&self) -> bool {
+        self.records
+            .values()
+            .any(|record| record.snoozed_until_ms.is_some())
     }
 
     /// Reconcile a complete endpoint observation, including duplicate attachments.
@@ -368,6 +386,7 @@ impl InboxRegistry {
             let Some(group) = grouped.get(id) else {
                 record.attachments.clear();
                 record.execution = ExecutionState::Closed;
+                record.queued_human_work = false;
                 next.pending_completions.remove(id);
                 record.section = project(record, false);
                 continue;
@@ -441,14 +460,28 @@ impl InboxRegistry {
         // Boot-scoped records cannot be safely recovered after their terminal disappears.
         next.records
             .retain(|_, record| record.session_ref.is_some() || !record.attachments.is_empty());
+        next.release_snoozes(now_ms);
         next.release_completions(now_ms);
         self.commit(next)
     }
 
     pub fn tick(&mut self, now_ms: u64) -> Result<bool, InboxError> {
         let mut next = self.clone();
+        next.release_snoozes(now_ms);
         next.release_completions(now_ms);
         self.commit(next)
+    }
+
+    fn release_snoozes(&mut self, now_ms: u64) {
+        for (id, record) in &mut self.records {
+            if record
+                .snoozed_until_ms
+                .is_some_and(|deadline| deadline <= now_ms)
+            {
+                reopen(record, now_ms);
+                record.section = project(record, self.pending_completions.contains_key(id));
+            }
+        }
     }
 
     fn release_completions(&mut self, now_ms: u64) {
@@ -482,13 +515,22 @@ impl InboxRegistry {
         let id = id.as_str();
         let current = self.records.get(id).ok_or(InboxError::NotFound)?;
         let satisfied = match &action {
-            ConversationAction::Settle => current.disposition == Disposition::Settled,
+            ConversationAction::Settle => {
+                current.disposition == Disposition::Settled && current.snoozed_until_ms.is_none()
+            }
             ConversationAction::SettleAndClose => {
                 current.disposition == Disposition::Settled
                     && current.execution == ExecutionState::Closed
                     && current.attachments.is_empty()
+                    && current.snoozed_until_ms.is_none()
             }
-            ConversationAction::Reopen => current.disposition == Disposition::Inbox,
+            ConversationAction::Reopen => {
+                current.disposition == Disposition::Inbox && current.snoozed_until_ms.is_none()
+            }
+            ConversationAction::Snooze { wake_at_ms } => {
+                current.snoozed_until_ms == Some(*wake_at_ms)
+            }
+            ConversationAction::Wake => current.snoozed_until_ms.is_none(),
             ConversationAction::BeginResume => current.resume_state == ResumeState::Pending,
             ConversationAction::ResumeLaunched(target) => {
                 current.resume_target.as_ref() == Some(target.as_ref())
@@ -496,6 +538,7 @@ impl InboxRegistry {
             ConversationAction::ResumeSucceeded => {
                 current.resume_state == ResumeState::None
                     && current.disposition == Disposition::Inbox
+                    && current.snoozed_until_ms.is_none()
             }
             ConversationAction::ResumeFailed => current.resume_state == ResumeState::None,
             ConversationAction::ResumeUncertain => current.resume_state == ResumeState::Uncertain,
@@ -558,8 +601,31 @@ impl InboxRegistry {
                 }
                 record.disposition = Disposition::Settled;
                 record.settled_at_ms = Some(now_ms);
+                record.snoozed_until_ms = None;
             }
-            ConversationAction::Reopen => reopen(record, now_ms),
+            ConversationAction::Snooze { wake_at_ms } => {
+                let duration = wake_at_ms.checked_sub(now_ms);
+                if duration.is_none_or(|duration| {
+                    !(MIN_SNOOZE_DURATION_MS..=MAX_SNOOZE_DURATION_MS).contains(&duration)
+                }) {
+                    return Err(InboxError::Ineligible(
+                        "snooze duration must be between 1 minute and 30 days".into(),
+                    ));
+                }
+                if record.session_ref.is_none()
+                    || matches!(
+                        record.execution,
+                        ExecutionState::Unknown | ExecutionState::Unavailable
+                    )
+                    || record.resume_state != ResumeState::None
+                {
+                    return Err(InboxError::Ineligible("conversation is unavailable, lacks durable identity, or has an unresolved resume".into()));
+                }
+                record.disposition = Disposition::Inbox;
+                record.settled_at_ms = None;
+                record.snoozed_until_ms = Some(wake_at_ms);
+            }
+            ConversationAction::Reopen | ConversationAction::Wake => reopen(record, now_ms),
             ConversationAction::BeginResume => {
                 if record.session_ref.is_none()
                     || !record.attachments.is_empty()
@@ -611,6 +677,54 @@ impl InboxRegistry {
         record.section = project(record, false);
         self.commit(next)?;
         Ok(self.records[id].clone())
+    }
+
+    /// Caller must verify a fresh native shutdown report followed by release of its sole attachment.
+    pub(crate) fn settle_after_confirmed_exit(
+        &mut self,
+        id: &str,
+        terminal_id: &str,
+        session: &PersistedAgentSession,
+        last_submission: Option<u64>,
+        now_ms: u64,
+    ) -> Result<bool, InboxError> {
+        let record = self.records.get(id).ok_or(InboxError::NotFound)?;
+        if terminal_id.is_empty()
+            || record.provider != session.agent
+            || record.source != session.source
+            || record.session_ref.as_ref() != Some(&session.session_ref)
+            || record.saved_location.terminal_id != terminal_id
+            || !record.attachments.is_empty()
+            || record.execution != ExecutionState::Closed
+            || record.resume_state != ResumeState::None
+            || record.queued_human_work
+            || record.last_human_submission_at_ms != last_submission
+        {
+            return Err(InboxError::Ineligible(
+                "confirmed session exit no longer matches the closed conversation".into(),
+            ));
+        }
+        if self.writes_blocked {
+            return Err(InboxError::Recovery(
+                self.recovery_error.clone().unwrap_or_default(),
+            ));
+        }
+        if record.disposition == Disposition::Settled
+            && record.snoozed_until_ms.is_none()
+            && !record.blocking_request
+        {
+            return Ok(false);
+        }
+        let mut next = self.clone();
+        let record = next.records.get_mut(id).expect("record checked");
+        // Native shutdown ends the old request; retained detector state cannot keep it active.
+        record.blocking_request = false;
+        record.disposition = Disposition::Settled;
+        record.settled_at_ms = Some(now_ms);
+        record.snoozed_until_ms = None;
+        next.pending_completions.remove(id);
+        record.section = project(record, false);
+        self.commit(next)
     }
 
     /// Call only for a verified human submission, never an inferred Working transition.
@@ -736,6 +850,7 @@ fn new_record(observation: &ConversationObservation, id: &str, now_ms: u64) -> C
         attention_returned_at_ms: now_ms,
         last_human_submission_at_ms: None,
         settled_at_ms: None,
+        snoozed_until_ms: None,
         completed_at_ms: None,
         revision: 0,
         attachments: Vec::new(),
@@ -755,6 +870,7 @@ fn new_record(observation: &ConversationObservation, id: &str, now_ms: u64) -> C
 fn reopen(record: &mut ConversationRecord, now_ms: u64) {
     record.disposition = Disposition::Inbox;
     record.settled_at_ms = None;
+    record.snoozed_until_ms = None;
     record.attention_returned_at_ms = now_ms;
 }
 
@@ -973,6 +1089,471 @@ mod tests {
 
     fn registry() -> InboxRegistry {
         InboxRegistry::load(None, "boot-one".into())
+    }
+
+    fn snooze(registry: &mut InboxRegistry, now: u64, wake_at_ms: u64) -> ConversationRecord {
+        let record = sole(registry);
+        registry
+            .mutate(
+                &record.id,
+                record.revision,
+                ConversationAction::Snooze { wake_at_ms },
+                now,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn snooze_survives_completion_and_continuation_until_expiry() {
+        let mut registry = registry();
+        let mut observed = observation(Some("one"), 1, ExecutionState::Working);
+        registry
+            .reconcile(std::slice::from_ref(&observed), 10)
+            .unwrap();
+        let snoozed = snooze(&mut registry, 20, 60_020);
+        assert_eq!(registry.next_deadline_ms(), Some(60_020));
+        observed.execution = ExecutionState::Idle;
+        registry
+            .reconcile(std::slice::from_ref(&observed), 30)
+            .unwrap();
+        registry.tick(2_030).unwrap();
+        assert_eq!(sole(&registry).snoozed_until_ms, Some(60_020));
+        assert_eq!(sole(&registry).completed_at_ms, Some(2_030));
+        observed.execution = ExecutionState::Working;
+        registry.reconcile(&[observed], 3_000).unwrap();
+        assert_eq!(sole(&registry).snoozed_until_ms, snoozed.snoozed_until_ms);
+        assert!(!registry.tick(60_019).unwrap());
+        assert!(registry.tick(60_020).unwrap());
+        let awake = sole(&registry);
+        assert_eq!(awake.snoozed_until_ms, None);
+        assert_eq!(awake.disposition, Disposition::Inbox);
+        assert_eq!(awake.section, ConversationSection::Working);
+        assert_eq!(awake.attention_returned_at_ms, 60_020);
+        assert!(!registry.tick(60_021).unwrap());
+    }
+
+    #[test]
+    fn snooze_persists_across_restart_and_expires_without_observations() {
+        let path = temp_path("snooze-restart");
+        let mut registry = InboxRegistry::load(Some(path.clone()), "one".into());
+        let mut observed = observation(Some("one"), 1, ExecutionState::Idle);
+        observed.blocking_request = true;
+        observed.failure = true;
+        registry
+            .reconcile(std::slice::from_ref(&observed), 10)
+            .unwrap();
+        snooze(&mut registry, 20, 60_020);
+        let mut restored = InboxRegistry::load(Some(path.clone()), "two".into());
+        assert_eq!(restored.next_deadline_ms(), Some(60_020));
+        restored
+            .reconcile(std::slice::from_ref(&observed), 30)
+            .unwrap();
+        let before = sole(&restored);
+        assert_eq!(before.snoozed_until_ms, Some(60_020));
+        assert!(!restored.reconcile(&[observed], 40).unwrap());
+        assert_eq!(sole(&restored), before);
+        restored = InboxRegistry::load(Some(path.clone()), "three".into());
+        assert!(restored.tick(70_000).unwrap());
+        assert_eq!(sole(&restored).snoozed_until_ms, None);
+        assert_eq!(sole(&restored).attention_returned_at_ms, 70_000);
+        let again = InboxRegistry::load(Some(path.clone()), "four".into());
+        assert_eq!(sole(&again).snoozed_until_ms, None);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fresh_attention_edges_and_verified_human_submission_wake_early() {
+        for failure in [false, true] {
+            let mut registry = registry();
+            let mut observed = observation(Some("one"), 1, ExecutionState::Idle);
+            registry
+                .reconcile(std::slice::from_ref(&observed), 10)
+                .unwrap();
+            snooze(&mut registry, 20, 60_020);
+            observed.blocking_request = !failure;
+            observed.failure = failure;
+            registry
+                .reconcile(std::slice::from_ref(&observed), 30)
+                .unwrap();
+            assert_eq!(sole(&registry).snoozed_until_ms, None);
+            let before = sole(&registry);
+            assert!(!registry
+                .reconcile(std::slice::from_ref(&observed), 40)
+                .unwrap());
+            assert_eq!(sole(&registry), before);
+            snooze(&mut registry, 50, 60_050);
+            // A known request is deliberately deferred, including repeated snapshots.
+            assert!(!registry
+                .reconcile(std::slice::from_ref(&observed), 60)
+                .unwrap());
+            let record = sole(&registry);
+            registry.human_submission(&record.id, 70).unwrap();
+            assert_eq!(sole(&registry).snoozed_until_ms, None);
+            assert_eq!(sole(&registry).last_human_submission_at_ms, Some(70));
+        }
+    }
+
+    #[test]
+    fn stale_wake_and_resnooze_cannot_erase_a_new_deadline() {
+        let mut registry = registry();
+        registry
+            .reconcile(&[observation(Some("one"), 1, ExecutionState::Idle)], 10)
+            .unwrap();
+        let first = snooze(&mut registry, 20, 60_020);
+        assert_eq!(
+            registry
+                .mutate(
+                    &first.id,
+                    0,
+                    ConversationAction::Snooze { wake_at_ms: 60_020 },
+                    21
+                )
+                .unwrap(),
+            first
+        );
+        let awake = registry
+            .mutate(&first.id, first.revision, ConversationAction::Wake, 30)
+            .unwrap();
+        assert_eq!(
+            registry
+                .mutate(&first.id, first.revision, ConversationAction::Wake, 31)
+                .unwrap(),
+            awake
+        );
+        let second = snooze(&mut registry, 40, 120_040);
+        for action in [
+            ConversationAction::Wake,
+            ConversationAction::Snooze { wake_at_ms: 60_020 },
+        ] {
+            assert!(matches!(
+                registry.mutate(&first.id, first.revision, action, 50),
+                Err(InboxError::Conflict { .. })
+            ));
+            assert_eq!(sole(&registry), second);
+        }
+        assert!(!registry.tick(60_020).unwrap());
+        assert_eq!(sole(&registry), second);
+    }
+
+    #[test]
+    fn snooze_preserves_queued_work_while_settlement_remains_guarded() {
+        for execution in [ExecutionState::Working, ExecutionState::Idle] {
+            let mut registry = registry();
+            let mut observed = observation(Some("one"), 1, execution);
+            observed.queued_human_work = true;
+            registry.reconcile(&[observed], 10).unwrap();
+            let before = sole(&registry);
+            let snoozed = snooze(&mut registry, 20, 60_020);
+            assert!(snoozed.queued_human_work);
+            assert_eq!(snoozed.attachments, before.attachments);
+            assert_eq!(snoozed.execution, before.execution);
+            assert!(matches!(
+                registry.mutate(
+                    &snoozed.id,
+                    snoozed.revision,
+                    ConversationAction::Settle,
+                    30
+                ),
+                Err(InboxError::Ineligible(_))
+            ));
+            assert_eq!(sole(&registry), snoozed);
+        }
+    }
+
+    #[test]
+    fn snooze_rejects_unsafe_states_and_invalid_durations_without_changes() {
+        for case in 0..5 {
+            let mut registry = registry();
+            let mut observed = observation(
+                if case == 0 { None } else { Some("one") },
+                1,
+                ExecutionState::Idle,
+            );
+            if case == 1 {
+                observed.execution = ExecutionState::Unknown;
+            }
+            if case == 2 {
+                observed.execution = ExecutionState::Unavailable;
+            }
+            registry.reconcile(&[observed], 10).unwrap();
+            let before = sole(&registry);
+            if case >= 3 {
+                registry.records.get_mut(&before.id).unwrap().resume_state = if case == 3 {
+                    ResumeState::Pending
+                } else {
+                    ResumeState::Uncertain
+                };
+            }
+            let before = sole(&registry);
+            assert!(matches!(
+                registry.mutate(
+                    &before.id,
+                    before.revision,
+                    ConversationAction::Snooze { wake_at_ms: 60_020 },
+                    20
+                ),
+                Err(InboxError::Ineligible(_))
+            ));
+            assert_eq!(sole(&registry), before);
+        }
+        let mut registry = registry();
+        registry
+            .reconcile(&[observation(Some("one"), 1, ExecutionState::Idle)], 10)
+            .unwrap();
+        let before = sole(&registry);
+        for wake_at_ms in [0, 20, 60_019, MAX_SNOOZE_DURATION_MS + 21, u64::MAX] {
+            assert!(registry
+                .mutate(
+                    &before.id,
+                    before.revision,
+                    ConversationAction::Snooze { wake_at_ms },
+                    20
+                )
+                .is_err());
+            assert_eq!(sole(&registry), before);
+        }
+    }
+
+    #[test]
+    fn settle_reopen_and_successful_resume_clear_snooze() {
+        for action in [
+            ConversationAction::Settle,
+            ConversationAction::Reopen,
+            ConversationAction::ResumeSucceeded,
+        ] {
+            let mut registry = registry();
+            registry
+                .reconcile(&[observation(Some("one"), 1, ExecutionState::Idle)], 10)
+                .unwrap();
+            let record = snooze(&mut registry, 20, 60_020);
+            let updated = registry
+                .mutate(&record.id, record.revision, action, 30)
+                .unwrap();
+            assert_eq!(updated.snoozed_until_ms, None);
+            assert!(!registry.has_snoozed_conversations());
+        }
+    }
+
+    #[test]
+    fn snooze_and_expiry_persistence_failures_keep_committed_deadline() {
+        let path = temp_path("snooze-rollback");
+        let mut registry = InboxRegistry::load(Some(path.clone()), "one".into());
+        registry
+            .reconcile(&[observation(Some("one"), 1, ExecutionState::Idle)], 10)
+            .unwrap();
+        let before = sole(&registry);
+        std::fs::create_dir(sidecar(&path, "bak")).unwrap();
+        assert!(registry
+            .mutate(
+                &before.id,
+                before.revision,
+                ConversationAction::Snooze { wake_at_ms: 60_020 },
+                20
+            )
+            .is_err());
+        assert_eq!(sole(&registry), before);
+        std::fs::remove_dir(sidecar(&path, "bak")).unwrap();
+        let snoozed = snooze(&mut registry, 20, 60_020);
+        std::fs::remove_file(sidecar(&path, "bak")).unwrap();
+        std::fs::create_dir(sidecar(&path, "bak")).unwrap();
+        assert!(registry.tick(60_020).is_err());
+        assert_eq!(sole(&registry), snoozed);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn vanished_runtime_clears_queued_work_and_allows_explicit_settlement() {
+        let mut registry = registry();
+        let mut observed = observation(Some("one"), 1, ExecutionState::Working);
+        observed.queued_human_work = true;
+        registry.reconcile(&[observed], 10).unwrap();
+        assert!(sole(&registry).queued_human_work);
+        registry.reconcile(&[], 20).unwrap();
+        let closed = sole(&registry);
+        assert_eq!(closed.execution, ExecutionState::Closed);
+        assert!(closed.attachments.is_empty());
+        assert!(!closed.queued_human_work);
+        assert_eq!(closed.disposition, Disposition::Inbox);
+        let settled = registry
+            .mutate(&closed.id, closed.revision, ConversationAction::Settle, 30)
+            .unwrap();
+        assert_eq!(settled.disposition, Disposition::Settled);
+    }
+
+    #[test]
+    fn restart_drops_queued_runtime_work_but_preserves_blocking_attention() {
+        let path = temp_path("queued-restart");
+        let mut registry = InboxRegistry::load(Some(path.clone()), "one".into());
+        let mut observed = observation(Some("one"), 1, ExecutionState::Working);
+        observed.queued_human_work = true;
+        observed.blocking_request = true;
+        observed.failure = true;
+        registry.reconcile(&[observed], 10).unwrap();
+        let restored = InboxRegistry::load(Some(path.clone()), "two".into());
+        let closed = sole(&restored);
+        assert!(!closed.queued_human_work);
+        assert!(closed.blocking_request);
+        assert!(closed.failure);
+        assert_eq!(closed.section, ConversationSection::Inbox);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn native_session(record: &ConversationRecord) -> PersistedAgentSession {
+        PersistedAgentSession {
+            source: record.source.clone(),
+            agent: record.provider.clone(),
+            session_ref: record.session_ref.clone().unwrap(),
+        }
+    }
+
+    #[test]
+    fn confirmed_native_exit_settles_closed_request_without_retiring_the_shell() {
+        let mut registry = registry();
+        let mut observed = observation(Some("one"), 1, ExecutionState::Working);
+        observed.blocking_request = true;
+        observed.failure = true;
+        registry.reconcile(&[observed], 10).unwrap();
+        let snoozed = snooze(&mut registry, 20, 60_020);
+        registry.reconcile(&[], 30).unwrap();
+        let closed = sole(&registry);
+        assert!(closed.blocking_request);
+        assert!(registry
+            .settle_after_confirmed_exit(
+                &closed.id,
+                &closed.saved_location.terminal_id,
+                &native_session(&closed),
+                None,
+                40
+            )
+            .unwrap());
+        let settled = sole(&registry);
+        assert_eq!(settled.id, snoozed.id);
+        assert_eq!(settled.disposition, Disposition::Settled);
+        assert_eq!(settled.section, ConversationSection::Settled);
+        assert_eq!(settled.snoozed_until_ms, None);
+        assert!(!settled.blocking_request);
+        assert!(settled.failure);
+        assert!(settled.retired_terminal_ids.is_empty());
+        assert!(!registry
+            .settle_after_confirmed_exit(
+                &closed.id,
+                &closed.saved_location.terminal_id,
+                &native_session(&closed),
+                None,
+                50
+            )
+            .unwrap());
+        assert_eq!(sole(&registry), settled);
+    }
+
+    #[test]
+    fn confirmed_exit_rejects_changed_identity_generation_or_human_work() {
+        for case in 0..9 {
+            let mut registry = registry();
+            registry
+                .reconcile(&[observation(Some("one"), 1, ExecutionState::Idle)], 10)
+                .unwrap();
+            registry.reconcile(&[], 20).unwrap();
+            let closed = sole(&registry);
+            let mut session = native_session(&closed);
+            let mut terminal = closed.saved_location.terminal_id.clone();
+            match case {
+                0 => session.agent = "other".into(),
+                1 => session.source = "other".into(),
+                2 => session.session_ref = AgentSessionRef::id("other").unwrap(),
+                3 => terminal = "replacement".into(),
+                4 => registry
+                    .records
+                    .get_mut(&closed.id)
+                    .unwrap()
+                    .attachments
+                    .push(closed.saved_location.clone()),
+                5 => {
+                    registry.records.get_mut(&closed.id).unwrap().execution =
+                        ExecutionState::Working
+                }
+                6 => {
+                    registry.records.get_mut(&closed.id).unwrap().resume_state =
+                        ResumeState::Uncertain
+                }
+                7 => {
+                    registry
+                        .records
+                        .get_mut(&closed.id)
+                        .unwrap()
+                        .queued_human_work = true
+                }
+                8 => {
+                    registry
+                        .records
+                        .get_mut(&closed.id)
+                        .unwrap()
+                        .last_human_submission_at_ms = Some(21)
+                }
+                _ => unreachable!(),
+            }
+            let before = sole(&registry);
+            assert!(matches!(
+                registry.settle_after_confirmed_exit(&closed.id, &terminal, &session, None, 30),
+                Err(InboxError::Ineligible(_))
+            ));
+            assert_eq!(sole(&registry), before);
+        }
+    }
+
+    #[test]
+    fn confirmed_exit_persistence_failure_keeps_attention_and_retries_atomically() {
+        let path = temp_path("confirmed-exit-rollback");
+        let mut registry = InboxRegistry::load(Some(path.clone()), "one".into());
+        let mut observed = observation(Some("one"), 1, ExecutionState::Idle);
+        observed.blocking_request = true;
+        registry.reconcile(&[observed], 10).unwrap();
+        registry.reconcile(&[], 20).unwrap();
+        let before = sole(&registry);
+        let session = native_session(&before);
+        std::fs::remove_file(sidecar(&path, "bak")).unwrap();
+        std::fs::create_dir(sidecar(&path, "bak")).unwrap();
+        assert!(matches!(
+            registry.settle_after_confirmed_exit(
+                &before.id,
+                &before.saved_location.terminal_id,
+                &session,
+                None,
+                30
+            ),
+            Err(InboxError::Persistence(_))
+        ));
+        assert_eq!(sole(&registry), before);
+        let restored = InboxRegistry::load(Some(path.clone()), "two".into());
+        assert_eq!(sole(&restored).disposition, Disposition::Inbox);
+        assert!(sole(&restored).blocking_request);
+        std::fs::remove_dir(sidecar(&path, "bak")).unwrap();
+        assert!(registry
+            .settle_after_confirmed_exit(
+                &before.id,
+                &before.saved_location.terminal_id,
+                &session,
+                None,
+                40
+            )
+            .unwrap());
+        let restored = InboxRegistry::load(Some(path.clone()), "three".into());
+        assert_eq!(sole(&restored).disposition, Disposition::Settled);
+        assert!(!sole(&restored).blocking_request);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn old_record_json_defaults_to_awake_and_omits_empty_snooze() {
+        let mut registry = registry();
+        registry
+            .reconcile(&[observation(Some("one"), 1, ExecutionState::Idle)], 10)
+            .unwrap();
+        let before = sole(&registry);
+        let value = serde_json::to_value(&before).unwrap();
+        assert!(value.get("snoozed_until_ms").is_none());
+        let restored: ConversationRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, before);
     }
 
     #[test]

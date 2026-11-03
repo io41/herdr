@@ -299,8 +299,9 @@ impl ClientShellState {
                 endpoint_id,
                 conversation_id,
             } => {
+                let details = matches!(self.overlay.as_ref(), Some(ClientShellOverlay::Navigator(navigator)) if navigator.filter == Some(ClientNavigatorFilter::Snoozed));
                 self.overlay = None;
-                self.open_conversation(endpoint_id, conversation_id, false, outcome);
+                self.open_conversation(endpoint_id, conversation_id, details, outcome);
                 return;
             }
             ClientNavigatorTarget::Machine { endpoint_id } => {
@@ -618,6 +619,8 @@ impl ClientShellState {
                 let action = match key.code {
                     KeyCode::Char('s') => Some(ClientContextMenuAction::ConversationSettle),
                     KeyCode::Char('r') => Some(ClientContextMenuAction::ConversationResume),
+                    KeyCode::Char('z') => Some(ClientContextMenuAction::ConversationSnooze),
+                    KeyCode::Char('w') => Some(ClientContextMenuAction::ConversationWake),
                     _ => None,
                 };
                 if let Some(action) = action {
@@ -628,7 +631,25 @@ impl ClientShellState {
                                 ClientContextMenuTarget::Conversation { .. }
                             ) =>
                         {
-                            menu.items().iter().position(|item| item.action == action)
+                            menu.items().iter().position(|item| {
+                                item.action == action
+                                    || (item.action == ClientContextMenuAction::Disabled
+                                        && match action {
+                                            ClientContextMenuAction::ConversationSettle => {
+                                                item.label.starts_with("Settle  s")
+                                            }
+                                            ClientContextMenuAction::ConversationResume => {
+                                                item.label.starts_with("Restore  r")
+                                            }
+                                            ClientContextMenuAction::ConversationSnooze => {
+                                                item.label.starts_with("Snooze…  z")
+                                            }
+                                            ClientContextMenuAction::ConversationWake => {
+                                                item.label.starts_with("Wake  w")
+                                            }
+                                            _ => false,
+                                        })
+                            })
                         }
                         _ => None,
                     };

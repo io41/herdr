@@ -200,6 +200,13 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
         10,
         None,
     )?;
+    ensure_command_hook(
+        hooks,
+        "SessionEnd",
+        hook_command(&hook_path, Some("session")),
+        3,
+        None,
+    )?;
     remove_legacy_bash_hook_file(&hook_path)?;
 
     write_config(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
@@ -620,6 +627,8 @@ pub(crate) fn uninstall_codex() -> io::Result<CodexUninstallResult> {
             "codex hooks file",
             "codex hooks file hooks",
         )? {
+            updated_hooks |=
+                remove_hook_commands(hooks, "SessionEnd", &hook_path, Some("session"))?;
             updated_hooks |= remove_hook_commands(hooks, "SessionStart", &hook_path, Some("idle"))?;
             updated_hooks |=
                 remove_hook_commands(hooks, "SessionStart", &hook_path, Some("session"))?;

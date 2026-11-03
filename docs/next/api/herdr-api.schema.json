@@ -1401,6 +1401,29 @@
           ],
           "type": "object"
         },
+        "AgentConversationSnoozeParams": {
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "duration_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expected_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "conversation_id",
+            "expected_revision",
+            "duration_ms"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -3112,6 +3135,49 @@
             "source",
             "agent",
             "state"
+          ],
+          "type": "object"
+        },
+        "PaneReportAgentSessionEndParams": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_session_id": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "reported_at_unix_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "source": {
+              "type": "string"
+            },
+            "transcript_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "source",
+            "agent",
+            "seq",
+            "reported_at_unix_ms",
+            "agent_session_id",
+            "transcript_path",
+            "reason"
           ],
           "type": "object"
         },
@@ -6249,6 +6315,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.report_agent_session_end",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportAgentSessionEndParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.report_metadata",
               "type": "string"
             },
@@ -6590,6 +6672,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.snooze",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationSnoozeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.wake",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationMutationParams"
             }
           },
           "required": [

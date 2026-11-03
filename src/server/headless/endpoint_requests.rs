@@ -74,6 +74,8 @@ impl HeadlessServer {
                 | api::schema::Method::AgentConversationRestore(_)
                 | api::schema::Method::AgentConversationReopen(_)
                 | api::schema::Method::AgentConversationResume(_)
+                | api::schema::Method::AgentConversationSnooze(_)
+                | api::schema::Method::AgentConversationWake(_)
         );
         if !surface_active && !conversation_method {
             let message = crate::server::client_commands::error_message(

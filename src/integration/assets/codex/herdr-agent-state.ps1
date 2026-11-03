@@ -2,7 +2,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codex
-# HERDR_INTEGRATION_VERSION=10
+# HERDR_INTEGRATION_VERSION=11
 
 param([string]$Action = "")
 
@@ -20,7 +20,8 @@ try {
     exit 0
 }
 
-if ($payload.hook_event_name -and $payload.hook_event_name -ne "SessionStart") { exit 0 }
+if ($payload.hook_event_name -and $payload.hook_event_name -notin @("SessionStart", "SessionEnd")) { exit 0 }
+if ($payload.hook_event_name -eq "SessionEnd" -and $payload.reason -cne "other") { exit 0 }
 
 $sessionId = $payload.session_id
 if ([string]::IsNullOrWhiteSpace($sessionId)) { exit 0 }
@@ -32,7 +33,7 @@ $herdr = if ([string]::IsNullOrWhiteSpace($env:HERDR_BIN_PATH)) { "herdr" } else
 try {
     $args = @(
         "pane",
-        "report-agent-session",
+        $(if ($payload.hook_event_name -eq "SessionEnd") { "report-agent-session-end" } else { "report-agent-session" }),
         $env:HERDR_PANE_ID,
         "--source",
         "herdr:codex",
@@ -43,6 +44,9 @@ try {
         "--agent-session-id",
         "$sessionId"
     )
+    if ($payload.hook_event_name -eq "SessionEnd") {
+        $args += @("--reason", "other", "--transcript-path", "$($payload.transcript_path)", "--reported-at-unix-ms", "$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())")
+    }
     if ($payload.hook_event_name -eq "SessionStart" -and $payload.source -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.source)) {
         $args += @("--session-start-source", "$($payload.source)")
     }

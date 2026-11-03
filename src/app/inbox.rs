@@ -183,6 +183,7 @@ impl App {
                         capability_limits: vec![
                             "Terminal drafts, unsupported editing input, and mouse button actions forwarded to the agent prevent settlement until a submitted turn completes or the process exits.".into(),
                             "Provider status does not distinguish typed approval, question, failure, or queued human work; blocked status requires attention.".into(),
+                            "Snooze wakes on a new blocked-status edge; providers do not supply request event identities or freshness, so repeated requests while status stays blocked cannot wake early.".into(),
                         ],
                     });
                 }
@@ -221,6 +222,11 @@ impl App {
     pub(super) fn sync_agent_inbox_deadline(&mut self) {
         self.agent_inbox_deadline = self.agent_inbox.next_deadline_ms().map(|deadline| {
             let delay = Duration::from_millis(deadline.saturating_sub(now_ms()));
+            let delay = if self.agent_inbox.has_snoozed_conversations() {
+                delay.min(Duration::from_secs(60))
+            } else {
+                delay
+            };
             let delay = if self.agent_inbox_error.is_some() {
                 delay.max(Duration::from_secs(1))
             } else {
@@ -260,6 +266,59 @@ impl App {
             .map(|record| record.id)
     }
 
+    pub(crate) fn settle_conversation_after_confirmed_exit(
+        &mut self,
+        conversation_id: &str,
+        terminal_id: &str,
+        session: &crate::agent_resume::PersistedAgentSession,
+        last_submission: Option<u64>,
+    ) {
+        let result = self.agent_inbox.settle_after_confirmed_exit(
+            conversation_id,
+            terminal_id,
+            session,
+            last_submission,
+            now_ms(),
+        );
+        self.record_agent_inbox_result(result);
+        self.sync_agent_inbox_deadline();
+    }
+
+    pub(crate) fn reopen_conversation_after_manual_resume(
+        &mut self,
+        terminal_id: &str,
+        session: &crate::agent_resume::PersistedAgentSession,
+    ) -> bool {
+        let Some(record) = self.agent_inbox.records().into_iter().find(|record| {
+            record.provider == session.agent
+                && record.source == session.source
+                && record.session_ref.as_ref() == Some(&session.session_ref)
+                && record.resume_state == crate::agent_inbox::ResumeState::None
+                && record
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.terminal_id == terminal_id)
+        }) else {
+            return false;
+        };
+        if record.disposition == crate::agent_inbox::Disposition::Inbox {
+            return true;
+        }
+        let result = self
+            .agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                ConversationAction::Reopen,
+                now_ms(),
+            )
+            .map(|_| true);
+        let completed = result.is_ok();
+        self.record_agent_inbox_result(result);
+        self.sync_agent_inbox_deadline();
+        completed
+    }
+
     pub(super) fn finish_conversation_prompt(
         &mut self,
         conversation_id: &str,
@@ -278,6 +337,10 @@ impl App {
         } else {
             Ok(())
         };
+        if submitted && result.is_ok() {
+            self.pending_codex_session_ends
+                .retain(|_, pending| pending.conversation_id != conversation_id);
+        }
         if let Err(error) = &result {
             self.agent_inbox_error = Some(error.clone());
         }
@@ -559,6 +622,7 @@ impl App {
             Ok(record) => record,
             Err(error) => return conversation_error(id, error),
         };
+        self.discard_pending_codex_manual_resumes_for(&settled);
         self.sync_agent_inbox_deadline();
         if let Some(target) = target {
             if let Err(error) = self.close_pane(id.clone(), &target) {
@@ -574,19 +638,73 @@ impl App {
         }
     }
 
+    pub(super) fn handle_agent_conversation_snooze(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentConversationSnoozeParams,
+    ) -> String {
+        if !(crate::agent_inbox::MIN_SNOOZE_DURATION_MS
+            ..=crate::agent_inbox::MAX_SNOOZE_DURATION_MS)
+            .contains(&params.duration_ms)
+        {
+            return encode_error(
+                id,
+                "invalid_snooze_duration",
+                "duration_ms must be between 60000 and 2592000000",
+            );
+        }
+        let now = now_ms();
+        let Some(wake_at_ms) = now.checked_add(params.duration_ms) else {
+            return encode_error(
+                id,
+                "invalid_snooze_duration",
+                "snooze deadline exceeds the supported timestamp range",
+            );
+        };
+        // Use one wall-clock sample for duration validation and the absolute deadline.
+        self.apply_agent_conversation_mutation(
+            id,
+            AgentConversationMutationParams {
+                conversation_id: params.conversation_id,
+                expected_revision: params.expected_revision,
+            },
+            ConversationAction::Snooze { wake_at_ms },
+            now,
+        )
+    }
+
     pub(super) fn handle_agent_conversation_mutation(
         &mut self,
         id: String,
         params: AgentConversationMutationParams,
         action: ConversationAction,
     ) -> String {
+        self.apply_agent_conversation_mutation(id, params, action, now_ms())
+    }
+
+    fn apply_agent_conversation_mutation(
+        &mut self,
+        id: String,
+        params: AgentConversationMutationParams,
+        action: ConversationAction,
+        now: u64,
+    ) -> String {
+        let supersedes_manual_resume = matches!(
+            action,
+            ConversationAction::Settle
+                | ConversationAction::SettleAndClose
+                | ConversationAction::Snooze { .. }
+        );
         match self.agent_inbox.mutate(
             &params.conversation_id,
             params.expected_revision,
             action,
-            now_ms(),
+            now,
         ) {
             Ok(record) => {
+                if supersedes_manual_resume {
+                    self.discard_pending_codex_manual_resumes_for(&record);
+                }
                 self.sync_agent_inbox_deadline();
                 match serde_json::to_value(record) {
                     Ok(conversation) => {
@@ -665,6 +783,219 @@ mod tests {
             conversation_id: record.id.clone(),
             expected_revision: record.revision,
         }
+    }
+
+    #[test]
+    fn manual_resume_reports_failed_persistence_and_completes_after_retry() {
+        let (mut app, pane_id) = idle_app();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-manual-resume-retry-{}-{}",
+            std::process::id(),
+            pane_id.raw()
+        ));
+        let path = directory.join("conversations.json");
+        app.agent_inbox =
+            crate::agent_inbox::InboxRegistry::load(Some(path.clone()), "manual-resume".into());
+        app.sync_agent_conversations();
+        let record = app.agent_inbox.records().remove(0);
+        let terminal_id = record.attachments[0].terminal_id.clone();
+        let session = crate::agent_resume::PersistedAgentSession {
+            source: record.source.clone(),
+            agent: record.provider.clone(),
+            session_ref: record.session_ref.clone().unwrap(),
+        };
+        app.agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                ConversationAction::Settle,
+                now_ms(),
+            )
+            .unwrap();
+        std::fs::remove_file(directory.join("conversations.json.bak")).unwrap();
+        std::fs::create_dir(directory.join("conversations.json.bak")).unwrap();
+        assert!(!app.reopen_conversation_after_manual_resume(&terminal_id, &session));
+        assert!(app.agent_inbox_error.is_some());
+        assert_eq!(
+            app.agent_inbox.get(&record.id).unwrap().disposition,
+            Disposition::Settled
+        );
+        std::fs::remove_dir(directory.join("conversations.json.bak")).unwrap();
+        assert!(app.reopen_conversation_after_manual_resume(&terminal_id, &session));
+        assert!(app.agent_inbox_error.is_none());
+        assert_eq!(
+            app.agent_inbox.get(&record.id).unwrap().disposition,
+            Disposition::Inbox
+        );
+        assert!(app.reopen_conversation_after_manual_resume(&terminal_id, &session));
+        assert!(!app.reopen_conversation_after_manual_resume("not-attached", &session));
+        let restored = crate::agent_inbox::InboxRegistry::load(Some(path), "after-retry".into());
+        assert_eq!(
+            restored.get(&record.id).unwrap().disposition,
+            Disposition::Inbox
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snooze_api_validates_duration_and_wake_preserves_the_live_attachment() {
+        let (mut app, pane_id) = app_with_native_agent();
+        let before = app.agent_inbox.records().remove(0);
+        for duration_ms in [0, 59_999, crate::agent_inbox::MAX_SNOOZE_DURATION_MS + 1] {
+            let response = call(
+                &mut app,
+                Method::AgentConversationSnooze(
+                    crate::api::schema::AgentConversationSnoozeParams {
+                        conversation_id: before.id.clone(),
+                        expected_revision: before.revision,
+                        duration_ms,
+                    },
+                ),
+            );
+            assert_eq!(response["error"]["code"], "invalid_snooze_duration");
+            assert_eq!(app.agent_inbox.records()[0], before);
+        }
+        let earliest = now_ms() + 60_000;
+        let response = call(
+            &mut app,
+            Method::AgentConversationSnooze(crate::api::schema::AgentConversationSnoozeParams {
+                conversation_id: before.id.clone(),
+                expected_revision: before.revision,
+                duration_ms: 60_000,
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        let snoozed = app.agent_inbox.records().remove(0);
+        assert!(snoozed.snoozed_until_ms.unwrap() >= earliest);
+        assert!(snoozed.snoozed_until_ms.unwrap() <= now_ms() + 60_000);
+        assert_eq!(snoozed.attachments, before.attachments);
+        assert_eq!(snoozed.execution, ExecutionState::Working);
+        assert!(app.state.workspaces[0].pane_state(pane_id).is_some());
+        let response = call(&mut app, Method::AgentConversationWake(mutation(&snoozed)));
+        assert!(response.get("error").is_none(), "{response}");
+        let awake = app.agent_inbox.records().remove(0);
+        assert_eq!(awake.snoozed_until_ms, None);
+        assert_eq!(awake.section, ConversationSection::Working);
+        assert_eq!(awake.attachments, before.attachments);
+        let response = call(&mut app, Method::AgentConversationWake(mutation(&snoozed)));
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(app.agent_inbox.records()[0], awake);
+    }
+
+    #[tokio::test]
+    async fn snooze_preserves_active_work_and_unsubmitted_terminal_drafts() {
+        for (working, input) in [
+            (true, &b"submitted task\r"[..]),
+            (false, &b"unsent draft"[..]),
+        ] {
+            let (mut app, pane_id) = if working {
+                app_with_native_agent()
+            } else {
+                idle_app()
+            };
+            let (runtime, mut accepted) =
+                crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.state.insert_test_runtime(pane_id, runtime);
+            app.lookup_runtime_sender(0, pane_id)
+                .unwrap()
+                .try_send_bytes(bytes::Bytes::copy_from_slice(input))
+                .unwrap();
+            assert_eq!(accepted.try_recv().unwrap().as_ref(), input);
+            app.sync_agent_conversations();
+            let before = app.agent_inbox.records().remove(0);
+            assert!(before.queued_human_work);
+            let response = call(
+                &mut app,
+                Method::AgentConversationSnooze(
+                    crate::api::schema::AgentConversationSnoozeParams {
+                        conversation_id: before.id.clone(),
+                        expected_revision: before.revision,
+                        duration_ms: 60_000,
+                    },
+                ),
+            );
+            assert!(response.get("error").is_none(), "{response}");
+            let snoozed = app.agent_inbox.records().remove(0);
+            assert!(snoozed.snoozed_until_ms.is_some());
+            assert!(snoozed.queued_human_work);
+            assert_eq!(snoozed.attachments, before.attachments);
+            assert_eq!(snoozed.execution, before.execution);
+            assert!(app
+                .lookup_runtime_sender(0, pane_id)
+                .unwrap()
+                .has_pending_human_submission());
+            assert!(accepted.try_recv().is_err(), "snooze must not send input");
+            let rejected = call(
+                &mut app,
+                Method::AgentConversationSettle(mutation(&snoozed)),
+            );
+            assert_eq!(rejected["error"]["code"], "conversation_ineligible");
+            assert_eq!(app.agent_inbox.records()[0], snoozed);
+        }
+    }
+
+    #[test]
+    fn snooze_timer_rechecks_wall_clock_and_releases_overdue_deadlines_without_a_client() {
+        let (mut app, _) = app_with_native_agent();
+        let record = app.agent_inbox.records().remove(0);
+        let now = now_ms();
+        let snoozed = app
+            .agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                ConversationAction::Snooze {
+                    wake_at_ms: now + 86_400_000,
+                },
+                now,
+            )
+            .unwrap();
+        let before = Instant::now();
+        app.sync_agent_inbox_deadline();
+        let wait = app.agent_inbox_deadline.unwrap().duration_since(before);
+        assert!(wait <= Duration::from_secs(61));
+        assert!(wait >= Duration::from_secs(59));
+        // Model a deadline that became overdue after a forward wall-clock jump.
+        let now = now_ms();
+        app.agent_inbox
+            .mutate(
+                &record.id,
+                snoozed.revision,
+                ConversationAction::Snooze {
+                    wake_at_ms: now - 1,
+                },
+                now - 60_001,
+            )
+            .unwrap();
+        app.sync_agent_inbox_deadline();
+        assert!(app.tick_agent_conversations(Instant::now() + Duration::from_secs(1)));
+        let record = app.agent_inbox.records().remove(0);
+        assert_eq!(record.snoozed_until_ms, None);
+        assert_eq!(record.section, ConversationSection::Working);
+        assert!(app.agent_inbox_deadline.is_none());
+    }
+
+    #[test]
+    fn verified_prompt_submission_wakes_a_snoozed_conversation() {
+        let (mut app, _) = idle_app();
+        let record = app.agent_inbox.records().remove(0);
+        let response = call(
+            &mut app,
+            Method::AgentConversationSnooze(crate::api::schema::AgentConversationSnoozeParams {
+                conversation_id: record.id.clone(),
+                expected_revision: record.revision,
+                duration_ms: 60_000,
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        app.pending_conversation_prompts
+            .insert(record.id.clone(), 1);
+        app.sync_agent_conversations();
+        assert!(app.agent_inbox.records()[0].snoozed_until_ms.is_some());
+        app.finish_conversation_prompt(&record.id, true).unwrap();
+        let record = app.agent_inbox.records().remove(0);
+        assert_eq!(record.snoozed_until_ms, None);
+        assert!(record.last_human_submission_at_ms.is_some());
     }
 
     #[test]

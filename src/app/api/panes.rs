@@ -9,12 +9,12 @@ use crate::api::schema::{
     PaneListParams, PaneMoveDestination, PaneMoveParams, PaneMoveReason, PaneMoveResult,
     PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
-    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionEndParams,
+    PaneReportAgentSessionParams, PaneReportMetadataParams, PaneResizeParams, PaneResizeReason,
+    PaneResizeResult, PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason,
+    PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -1597,6 +1597,20 @@ impl App {
         )
     }
 
+    pub(super) fn handle_pane_report_agent_session_end(
+        &mut self,
+        id: String,
+        params: PaneReportAgentSessionEndParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if let Err(message) = self.observe_codex_session_end(ws_idx, pane_id, &params) {
+            return encode_error(id, "session_end_not_accepted", message);
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     pub(super) fn handle_pane_report_agent_session(
         &mut self,
         id: String,
@@ -1620,6 +1634,14 @@ impl App {
             params.agent_session_id,
             params.agent_session_path,
         );
+        let codex_resume = params.source == "herdr:codex"
+            && agent_label == "codex"
+            && params.session_start_source.as_deref() == Some("resume")
+            && params.seq.is_some();
+        let user_owned_resume = self.pane_terminal(ws_idx, pane_id).is_some_and(|terminal| {
+            !terminal.managed_agent_launch_pending()
+                && self.codex_process_origins.get(&terminal.id) != Some(&false)
+        });
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: session_ref.clone(),
@@ -1632,6 +1654,18 @@ impl App {
         });
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
+        if applied && codex_resume {
+            if let Some((terminal_id, session)) =
+                self.pane_terminal(ws_idx, pane_id).and_then(|terminal| {
+                    terminal
+                        .provider_reported_session()
+                        .cloned()
+                        .map(|session| (terminal.id.clone(), session))
+                })
+            {
+                self.observe_confirmed_codex_manual_resume(terminal_id, session, user_owned_resume);
+            }
+        }
         self.report_agent_resume(
             id,
             ws_idx,

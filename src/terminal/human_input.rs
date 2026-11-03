@@ -32,6 +32,10 @@ impl HumanInputState {
             match event {
                 RawInputEvent::Key(key) if key.kind == KeyEventKind::Release => {}
                 RawInputEvent::Key(key)
+                    if key.code == KeyCode::Esc
+                        && key.modifiers.is_empty()
+                        && key.generated_text.is_none() => {}
+                RawInputEvent::Key(key)
                     if key.code == KeyCode::Enter && key.modifiers.is_empty() =>
                 {
                     // Empty Enter can submit recalled/provider-owned text that Herdr cannot see.
@@ -178,6 +182,31 @@ impl UserInputCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_does_not_create_a_draft_or_discard_existing_input() {
+        let mut empty = HumanInputState::default();
+        empty.record_bytes(b"\x1b");
+        empty.observe(AgentState::Idle, Instant::now());
+        assert!(!empty.pending());
+
+        let mut draft = HumanInputState::default();
+        draft.record_bytes(b"keep this draft");
+        draft.record_bytes(b"\x1b");
+        assert!(draft.pending());
+
+        let mut submitted = HumanInputState::default();
+        submitted.record_bytes(b"\r");
+        let working = submitted.submitted.unwrap().0 + std::time::Duration::from_millis(1);
+        submitted.record_bytes(b"\x1b");
+        assert!(submitted.pending());
+        submitted.observe(AgentState::Working, working);
+        submitted.observe(
+            AgentState::Idle,
+            working + std::time::Duration::from_millis(1),
+        );
+        assert!(!submitted.pending());
+    }
 
     #[test]
     fn input_stays_pending_through_stale_idle_and_releases_after_work() {

@@ -30,6 +30,33 @@ fn notification_duration(kind: SemanticNotificationKind) -> std::time::Duration 
 }
 
 impl ClientShellState {
+    fn notification_is_snoozed(
+        &self,
+        endpoint_id: &ClientEndpointId,
+        event: &SemanticNotification,
+    ) -> bool {
+        if event.kind != SemanticNotificationKind::Finished {
+            return false;
+        }
+        self.endpoints
+            .iter()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+            .filter(|endpoint| {
+                endpoint.status == ClientEndpointStatus::Online
+                    && super::agent_inbox::cache_current(endpoint)
+            })
+            .and_then(|endpoint| endpoint.conversations.as_ref())
+            .filter(|cache| cache.projection.recovery_error.is_none())
+            .is_some_and(|cache| {
+                cache.projection.conversations.iter().any(|record| {
+                    super::agent_inbox::snoozed(record)
+                        && record.attachments.iter().any(|attachment| {
+                            Some(attachment.public_pane_id.as_str()) == event.pane_id.as_deref()
+                        })
+                })
+            })
+    }
+
     pub(super) fn retire_endpoint_notifications(&mut self, endpoint_id: &ClientEndpointId) {
         self.pending_notifications
             .retain(|pending| &pending.endpoint_id != endpoint_id);
@@ -62,12 +89,15 @@ impl ClientShellState {
     }
 
     fn promote_queued_notification(&mut self, now: std::time::Instant) -> bool {
-        let Some(mut notification) = self.queued_notifications.pop_front() else {
-            return false;
-        };
-        notification.deadline = now + notification_duration(notification.event.kind);
-        self.visible_notification = Some(notification);
-        true
+        while let Some(mut notification) = self.queued_notifications.pop_front() {
+            if self.notification_is_snoozed(&notification.endpoint_id, &notification.event) {
+                continue;
+            }
+            notification.deadline = now + notification_duration(notification.event.kind);
+            self.visible_notification = Some(notification);
+            return true;
+        }
+        false
     }
 
     pub(super) fn focus_visible_notification(&mut self, outcome: &mut ClientShellInput) {
@@ -110,6 +140,9 @@ impl ClientShellState {
         event: SemanticNotification,
         now: std::time::Instant,
     ) -> (Vec<ClientShellNotificationEffect>, bool) {
+        if self.notification_is_snoozed(endpoint_id, &event) {
+            return (Vec::new(), false);
+        }
         let delay = if event.kind == SemanticNotificationKind::Custom {
             0
         } else {
@@ -170,7 +203,24 @@ impl ClientShellState {
         &mut self,
         now: std::time::Instant,
     ) -> (Vec<ClientShellNotificationEffect>, bool) {
-        let mut repaint = false;
+        let queued = std::mem::take(&mut self.queued_notifications);
+        self.queued_notifications = queued
+            .into_iter()
+            .filter(|notification| {
+                !self.notification_is_snoozed(&notification.endpoint_id, &notification.event)
+            })
+            .collect();
+        let snoozed_visible = self
+            .visible_notification
+            .as_ref()
+            .is_some_and(|notification| {
+                self.notification_is_snoozed(&notification.endpoint_id, &notification.event)
+            });
+        let mut repaint = snoozed_visible;
+        if snoozed_visible {
+            self.visible_notification = None;
+            self.promote_queued_notification(now);
+        }
         if self
             .visible_notification
             .as_ref()
@@ -192,6 +242,9 @@ impl ClientShellState {
         let pending = std::mem::take(&mut self.pending_notifications);
         let mut effects = Vec::new();
         for mut pending in pending {
+            if self.notification_is_snoozed(&pending.endpoint_id, &pending.event) {
+                continue;
+            }
             if pending.deadline > now {
                 self.pending_notifications.push(pending);
                 continue;
@@ -348,6 +401,9 @@ impl ClientShellState {
         endpoint_id: &ClientEndpointId,
         event: &SemanticNotification,
     ) -> NotificationValidation {
+        if self.notification_is_snoozed(endpoint_id, event) {
+            return NotificationValidation::Stale;
+        }
         let Some(pane_id) = event.pane_id.as_deref() else {
             // Finished notifications carry no independently trustworthy completion state. Without
             // a projected pane to verify as Done, do not emit completion chrome or sound.
@@ -445,6 +501,10 @@ impl ClientShellState {
         evidence: &mut InboxCompletionEvidence,
     ) -> NotificationValidation {
         use crate::agent_inbox::{ConversationSection, Disposition, ExecutionState, ResumeState};
+
+        if self.notification_is_snoozed(endpoint_id, event) {
+            return NotificationValidation::Stale;
+        }
 
         let Some(endpoint) = self
             .endpoints
@@ -738,6 +798,132 @@ mod inbox_tests {
                 .tick_notifications(now + std::time::Duration::from_secs(4))
                 .0
                 .is_empty());
+        }
+    }
+    #[test]
+    fn snoozed_finished_stays_quiet_in_both_notification_modes_and_pending_delivery() {
+        for inbox in [true, false] {
+            let mut state = state();
+            state.agent_inbox = inbox;
+            let now = std::time::Instant::now();
+            let mut sleeping = returned_record();
+            sleeping.snoozed_until_ms = Some(super::super::agent_inbox::now_ms() + 3_600_000);
+            project(&mut state, sleeping.clone(), 11);
+            assert!(state
+                .receive_notification(&ClientEndpointId::Local, event(), now)
+                .0
+                .is_empty());
+            assert!(state.pending_notifications.is_empty());
+            assert!(state
+                .tick_notifications(now + std::time::Duration::from_secs(4))
+                .0
+                .is_empty());
+            project(&mut state, returned_record(), 12);
+            state.config.toast_delay_seconds = 5;
+            state.receive_notification(&ClientEndpointId::Local, event(), now);
+            assert_eq!(state.pending_notifications.len(), 1);
+            project(&mut state, sleeping, 13);
+            assert!(state
+                .tick_notifications(now + std::time::Duration::from_secs(6))
+                .0
+                .is_empty());
+            assert!(state.pending_notifications.is_empty());
+        }
+    }
+
+    #[test]
+    fn snooze_retires_visible_and_queued_completion_cards_without_dropping_other_events() {
+        let mut state = state();
+        let now = std::time::Instant::now();
+        state.visible_notification = Some(ClientVisibleNotification {
+            endpoint_id: ClientEndpointId::Local,
+            event: event(),
+            deadline: now + std::time::Duration::from_secs(10),
+        });
+        state
+            .queued_notifications
+            .push_back(ClientVisibleNotification {
+                endpoint_id: ClientEndpointId::Local,
+                event: event(),
+                deadline: now,
+            });
+        let mut custom = event();
+        custom.kind = SemanticNotificationKind::Custom;
+        state
+            .queued_notifications
+            .push_back(ClientVisibleNotification {
+                endpoint_id: ClientEndpointId::Local,
+                event: custom,
+                deadline: now,
+            });
+        let mut sleeping = returned_record();
+        sleeping.snoozed_until_ms = Some(super::super::agent_inbox::now_ms() + 3_600_000);
+        project(&mut state, sleeping, 11);
+        let (effects, repaint) = state.tick_notifications(now);
+        assert!(effects.is_empty());
+        assert!(repaint);
+        assert!(state.queued_notifications.is_empty());
+        assert_eq!(
+            state.visible_notification.as_ref().unwrap().event.kind,
+            SemanticNotificationKind::Custom
+        );
+        let mut evidence = InboxCompletionEvidence {
+            boot_id: None,
+            sequence: None,
+            projection_revision: None,
+            attention_after_ms: None,
+        };
+        assert_eq!(
+            state.notification_validation(&ClientEndpointId::Local, &event()),
+            NotificationValidation::Stale
+        );
+        assert_eq!(
+            state.inbox_completion_validation(&ClientEndpointId::Local, &event(), &mut evidence),
+            NotificationValidation::Stale
+        );
+    }
+    #[test]
+    fn client_clock_past_deadline_cannot_enable_completion_before_server_wakes() {
+        for inbox in [true, false] {
+            let mut state = state();
+            state.agent_inbox = inbox;
+            let mut sleeping = returned_record();
+            sleeping.snoozed_until_ms = Some(1);
+            project(&mut state, sleeping, 11);
+            let now = std::time::Instant::now();
+            assert!(state.notification_is_snoozed(&ClientEndpointId::Local, &event()));
+            assert_eq!(
+                state.notification_validation(&ClientEndpointId::Local, &event()),
+                NotificationValidation::Stale
+            );
+            let mut evidence = InboxCompletionEvidence {
+                boot_id: None,
+                sequence: None,
+                projection_revision: None,
+                attention_after_ms: None,
+            };
+            assert_eq!(
+                state.inbox_completion_validation(
+                    &ClientEndpointId::Local,
+                    &event(),
+                    &mut evidence
+                ),
+                NotificationValidation::Stale
+            );
+            assert!(state
+                .receive_notification(&ClientEndpointId::Local, event(), now)
+                .0
+                .is_empty());
+            assert!(state.pending_notifications.is_empty());
+            assert!(state
+                .tick_notifications(now + std::time::Duration::from_secs(60))
+                .0
+                .is_empty());
+            project(&mut state, returned_record(), 12);
+            assert!(!state.notification_is_snoozed(&ClientEndpointId::Local, &event()));
+            state.config.toast_delay_seconds = 5;
+            state.receive_notification(&ClientEndpointId::Local, event(), now);
+            assert_eq!(state.pending_notifications.len(), 1);
         }
     }
 }

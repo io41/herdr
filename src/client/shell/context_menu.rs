@@ -9,7 +9,11 @@ impl ClientContextMenuOverlay {
             action,
         };
         match &self.target {
-            ClientContextMenuTarget::AgentViews { selected, expanded } => {
+            ClientContextMenuTarget::AgentViews {
+                selected,
+                expanded,
+                snoozed_count,
+            } => {
                 let mut items: Vec<_> = ["Inbox", "All agents by space", "All agents by attention"]
                     .into_iter()
                     .enumerate()
@@ -18,6 +22,10 @@ impl ClientContextMenuOverlay {
                         action: Action::AgentView(index),
                     })
                     .collect();
+                items.push(ClientContextMenuItem {
+                    label: format!("Snoozed… ({snoozed_count})"),
+                    action: Action::SnoozedConversations,
+                });
                 items.extend(["Inbox", "Working", "Settled"].into_iter().enumerate().map(
                     |(index, label)| ClientContextMenuItem {
                         label: format!(
@@ -39,6 +47,16 @@ impl ClientContextMenuOverlay {
                 methods,
                 ..
             } => super::agent_inbox::conversation_menu_items(record, *available, methods),
+            ClientContextMenuTarget::ConversationSnooze { .. } => [1, 4, 24]
+                .into_iter()
+                .map(|hours| ClientContextMenuItem {
+                    label: format!(
+                        "Snooze for {hours} {}",
+                        if hours == 1 { "hour" } else { "hours" }
+                    ),
+                    action: Action::ConversationSnoozeDuration(hours * 60 * 60 * 1_000),
+                })
+                .collect(),
             ClientContextMenuTarget::ConversationLocations { locations, .. } => locations
                 .iter()
                 .enumerate()
@@ -225,7 +243,7 @@ impl ClientShellState {
         index: usize,
         outcome: &mut ClientShellInput,
     ) {
-        let Some(ClientShellOverlay::ContextMenu(menu)) = self.overlay.take() else {
+        let Some(ClientShellOverlay::ContextMenu(mut menu)) = self.overlay.take() else {
             return;
         };
         let Some(action) = menu.items().get(index).map(|item| item.action) else {
@@ -233,6 +251,15 @@ impl ClientShellState {
             return;
         };
         if action == ClientContextMenuAction::Disabled {
+            menu.highlighted = index;
+            if let Some(item) = menu.items().get(index) {
+                self.push_endpoint_notice(
+                    ClientEndpointNoticeKind::Rejected,
+                    "conversation_action_disabled",
+                    "Action unavailable",
+                    item.label.clone(),
+                );
+            }
             self.overlay = Some(ClientShellOverlay::ContextMenu(menu));
             outcome.repaint = true;
             return;
@@ -251,6 +278,12 @@ impl ClientShellState {
                     }
                     self.agent_scroll = 0;
                     self.persist_chrome_preferences(outcome);
+                } else if action == ClientContextMenuAction::SnoozedConversations {
+                    self.open_navigator_overlay();
+                    if let Some(ClientShellOverlay::Navigator(navigator)) = self.overlay.as_mut() {
+                        navigator.filter = Some(ClientNavigatorFilter::Snoozed);
+                        navigator.selected = None;
+                    }
                 } else if let ClientContextMenuAction::AgentSection(index) = action {
                     let old = self.visible_conversations();
                     self.agent_inbox_expanded[index] = !self.agent_inbox_expanded[index];
@@ -263,6 +296,12 @@ impl ClientShellState {
                 record,
                 ..
             } => self.activate_conversation_action(endpoint_id, *record, action, outcome),
+            ClientContextMenuTarget::ConversationSnooze {
+                endpoint_id,
+                record,
+            } => {
+                self.activate_conversation_action(endpoint_id, *record, action, outcome);
+            }
             ClientContextMenuTarget::ConversationLocations {
                 endpoint_id,
                 record,

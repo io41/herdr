@@ -62,6 +62,30 @@ pub(super) fn record_status(record: &ConversationRecord, unavailable: bool) -> &
     }
 }
 
+pub(super) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+pub(super) fn snoozed(record: &ConversationRecord) -> bool {
+    // The owning endpoint clears expired snoozes; client clocks can differ.
+    record.snoozed_until_ms.is_some()
+}
+
+pub(super) fn snooze_detail(record: &ConversationRecord, now: u64) -> Option<String> {
+    let deadline = record.snoozed_until_ms?;
+    let minutes = deadline.saturating_sub(now).div_ceil(60_000);
+    Some(if minutes == 0 {
+        "Wake due".into()
+    } else if minutes < 60 {
+        format!("Wakes in {minutes} min")
+    } else {
+        format!("Wakes in {} h {} min", minutes / 60, minutes % 60)
+    })
+}
+
 pub(super) fn conversation_title(record: &ConversationRecord) -> String {
     if !record.title.trim().is_empty()
         && !record
@@ -174,7 +198,15 @@ pub(super) fn conversation_rows(endpoints: &[ClientShellEndpoint]) -> Vec<Conver
                 || cache.projection.recovery_error.is_some();
             let reserved = reserved_resume_terminals(&cache.projection.conversations);
             for record in &cache.projection.conversations {
-                if reserved_provisional(record, &reserved) {
+                if reserved_provisional(record, &reserved)
+                    || (!unavailable
+                        && snoozed(record)
+                        && !matches!(
+                            record.execution,
+                            ExecutionState::Unknown | ExecutionState::Unavailable
+                        )
+                        && record.resume_state == ResumeState::None)
+                {
                     continue;
                 }
                 let section = if unavailable
@@ -544,6 +576,32 @@ pub(super) fn render_conversation_panel(
 }
 
 impl ClientShellState {
+    pub(crate) fn tick_snooze_countdown(&mut self) -> bool {
+        self.tick_snooze_countdown_at(now_ms())
+    }
+
+    pub(super) fn tick_snooze_countdown_at(&mut self, now_ms: u64) -> bool {
+        let minute = now_ms / 60_000;
+        if self.snooze_countdown_minute.replace(minute) == Some(minute) {
+            return false;
+        }
+        match self.overlay.as_ref() {
+            Some(ClientShellOverlay::ContextMenu(menu)) => matches!(
+                &menu.target,
+                ClientContextMenuTarget::Conversation { record, .. }
+                    if record.snoozed_until_ms.is_some()
+            ),
+            Some(ClientShellOverlay::Navigator(navigator))
+                if navigator.filter == Some(ClientNavigatorFilter::Snoozed) =>
+            {
+                render::client_navigator_rows(&self.endpoints, &self.active_endpoint_id, navigator)
+                    .iter()
+                    .any(|row| matches!(row.target, ClientNavigatorTarget::Conversation { .. }))
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn open_agent_view_selector(&mut self, outcome: &mut ClientShellInput) {
         let selected = if self.agent_inbox {
             0
@@ -556,6 +614,13 @@ impl ClientShellState {
             target: ClientContextMenuTarget::AgentViews {
                 selected,
                 expanded: self.agent_inbox_expanded,
+                snoozed_count: self
+                    .endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint.conversations.as_ref())
+                    .flat_map(|cache| &cache.projection.conversations)
+                    .filter(|record| snoozed(record))
+                    .count(),
             },
             x: self.hits.agent_body.x,
             y: self.hits.agent_body.y.saturating_sub(2),
@@ -660,8 +725,12 @@ impl ClientShellState {
                 .find(|record| record.id == id)
         });
         if let Some(record) = record {
-            let available =
-                endpoint.status == ClientEndpointStatus::Online && cache_current(endpoint);
+            let available = endpoint.status == ClientEndpointStatus::Online
+                && cache_current(endpoint)
+                && endpoint
+                    .conversations
+                    .as_ref()
+                    .is_some_and(|cache| cache.projection.recovery_error.is_none());
             if !details
                 && available
                 && endpoint
@@ -790,6 +859,32 @@ impl ClientShellState {
                     attachment_terminal_id: Some(target.terminal_id.clone()),
                 })
             }
+            ClientContextMenuAction::ConversationSnooze => {
+                self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+                    target: ClientContextMenuTarget::ConversationSnooze {
+                        endpoint_id,
+                        record: Box::new(record),
+                    },
+                    x: self.hits.agent_body.right(),
+                    y: self.hits.agent_body.y,
+                    highlighted: 0,
+                }));
+                outcome.repaint = true;
+                return;
+            }
+            ClientContextMenuAction::ConversationSnoozeDuration(duration_ms) => {
+                Method::AgentConversationSnooze(crate::api::schema::AgentConversationSnoozeParams {
+                    conversation_id: record.id,
+                    expected_revision: record.revision,
+                    duration_ms,
+                })
+            }
+            ClientContextMenuAction::ConversationWake => {
+                Method::AgentConversationWake(AgentConversationMutationParams {
+                    conversation_id: record.id,
+                    expected_revision: record.revision,
+                })
+            }
             ClientContextMenuAction::ConversationSettle => {
                 Method::AgentConversationSettleAndClose(AgentConversationMutationParams {
                     conversation_id: record.id,
@@ -916,7 +1011,13 @@ impl ClientShellState {
         else {
             return;
         };
-        if endpoint.status != ClientEndpointStatus::Online || !cache_current(endpoint) {
+        if endpoint.status != ClientEndpointStatus::Online
+            || !cache_current(endpoint)
+            || endpoint
+                .conversations
+                .as_ref()
+                .is_some_and(|cache| cache.projection.recovery_error.is_some())
+        {
             outcome.repaint |= self.receive_endpoint_unavailable(format!(
                 "{} conversation data is unavailable. Reconnect before retrying.",
                 endpoint.label
@@ -1178,8 +1279,10 @@ pub(super) fn conversation_menu_items(
             Some("session identity unavailable")
         } else if record.resume_state != ResumeState::None {
             Some("awaiting session confirmation")
-        } else if record.execution == ExecutionState::Working || record.queued_human_work {
+        } else if record.execution == ExecutionState::Working {
             Some("working")
+        } else if record.queued_human_work {
+            Some("pending input or draft")
         } else if record.blocking_request {
             Some("needs input")
         } else if record.failure {
@@ -1204,6 +1307,50 @@ pub(super) fn conversation_menu_items(
             },
         });
     }
+    let reason = if !available {
+        Some("endpoint unavailable")
+    } else if !methods.contains("agent.conversation.snooze") {
+        Some("update endpoint")
+    } else if record.session_ref.is_none() {
+        Some("session identity unavailable")
+    } else if record.resume_state != ResumeState::None {
+        Some("awaiting session confirmation")
+    } else if matches!(
+        record.execution,
+        ExecutionState::Unknown | ExecutionState::Unavailable
+    ) {
+        Some("state unknown")
+    } else {
+        None
+    };
+    items.push(ClientContextMenuItem {
+        label: reason.map_or_else(
+            || "Snooze…  z".into(),
+            |reason| format!("Snooze…  z · {reason}"),
+        ),
+        action: if reason.is_none() {
+            Action::ConversationSnooze
+        } else {
+            Action::Disabled
+        },
+    });
+    if record.snoozed_until_ms.is_some() {
+        let reason = if !available {
+            Some("endpoint unavailable")
+        } else if !methods.contains("agent.conversation.wake") {
+            Some("update endpoint")
+        } else {
+            None
+        };
+        items.push(ClientContextMenuItem {
+            label: reason.map_or_else(|| "Wake  w".into(), |reason| format!("Wake  w · {reason}")),
+            action: if reason.is_none() {
+                Action::ConversationWake
+            } else {
+                Action::Disabled
+            },
+        });
+    }
     items
 }
 
@@ -1221,11 +1368,19 @@ pub(super) fn conversation_details(target: &ClientContextMenuTarget) -> Vec<Stri
                 ),
                 conversation_breadcrumb(record),
             ];
+            if let Some(detail) = snooze_detail(record, now_ms()) {
+                lines.push(detail);
+            }
             if let Some(error) = &record.resume_error {
                 lines.push(error.clone());
             }
             lines
         }
+        ClientContextMenuTarget::ConversationSnooze { record, .. } => vec![
+            conversation_title(record),
+            "Choose when to return this conversation.".into(),
+            "New requests may not wake it early.".into(),
+        ],
         ClientContextMenuTarget::ConversationLocations { cwd, locations, .. } => {
             let mut lines = vec![
                 format!("Resume directory: {cwd}"),

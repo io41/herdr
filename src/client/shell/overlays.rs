@@ -241,7 +241,11 @@ pub(crate) fn render_context_menu(
         let row = Rect::new(inner.x, row_y, inner.width, 1);
         let highlighted = index == menu.highlighted;
         let style = if item.action == ClientContextMenuAction::Disabled {
-            Style::default().fg(palette.overlay0).bg(palette.panel_bg)
+            Style::default().fg(palette.overlay0).bg(if highlighted {
+                palette.active_row_bg
+            } else {
+                palette.panel_bg
+            })
         } else if highlighted {
             Style::default()
                 .fg(panel_contrast_fg(palette))
@@ -784,6 +788,7 @@ fn render_navigator_overlay(
                 ClientNavigatorFilter::Working => "working",
                 ClientNavigatorFilter::Idle => "idle",
                 ClientNavigatorFilter::Done => "done",
+                ClientNavigatorFilter::Snoozed => "snoozed",
             }
         )
     } else if n.query.is_empty() {

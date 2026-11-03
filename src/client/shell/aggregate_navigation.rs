@@ -286,8 +286,10 @@ pub(super) fn navigator_rows(
         Some(ClientNavigatorFilter::Working) => status == crate::api::schema::AgentStatus::Working,
         Some(ClientNavigatorFilter::Idle) => status == crate::api::schema::AgentStatus::Idle,
         Some(ClientNavigatorFilter::Done) => status == crate::api::schema::AgentStatus::Done,
+        Some(ClientNavigatorFilter::Snoozed) => false,
         None => true,
     };
+    let now = super::agent_inbox::now_ms();
     let words = query.split_whitespace().collect::<Vec<_>>();
     let text = |value: &str| {
         if words.is_empty() {
@@ -480,18 +482,24 @@ pub(super) fn navigator_rows(
                 };
                 let title = super::agent_inbox::conversation_title(record);
                 let breadcrumb = super::agent_inbox::conversation_breadcrumb(record);
-                let unavailable = stale || !super::agent_inbox::cache_current(endpoint);
-                if !filter(status)
-                    || !(endpoint_query_matches
-                        || text(&format!(
-                            "{} {} {} {} {} {}",
-                            title,
-                            record.provider,
-                            breadcrumb,
-                            record.saved_location.cwd,
-                            record.saved_location.workspace_id,
-                            record.saved_location.tab_id
-                        )))
+                let unavailable = stale
+                    || !super::agent_inbox::cache_current(endpoint)
+                    || cache.projection.recovery_error.is_some();
+                let snoozed = super::agent_inbox::snoozed(record);
+                if !(if navigator.filter == Some(ClientNavigatorFilter::Snoozed) {
+                    snoozed
+                } else {
+                    filter(status)
+                }) || !(endpoint_query_matches
+                    || text(&format!(
+                        "{} {} {} {} {} {}",
+                        title,
+                        record.provider,
+                        breadcrumb,
+                        record.saved_location.cwd,
+                        record.saved_location.workspace_id,
+                        record.saved_location.tab_id
+                    )))
                 {
                     continue;
                 }
@@ -499,9 +507,12 @@ pub(super) fn navigator_rows(
                     depth: u8::from(federated),
                     label: title,
                     meta: format!(
-                        "{} · {}",
+                        "{} · {}{}",
                         super::agent_inbox::record_status(record, unavailable),
-                        record.provider
+                        record.provider,
+                        super::agent_inbox::snooze_detail(record, now)
+                            .map(|detail| format!(" · {detail}"))
+                            .unwrap_or_default()
                     ),
                     detail: breadcrumb,
                     agent: Some(record.provider.clone()),

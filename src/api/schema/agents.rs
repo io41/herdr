@@ -266,6 +266,13 @@ pub struct AgentConversationMutationParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentConversationSnoozeParams {
+    pub conversation_id: String,
+    pub expected_revision: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentConversationResumeParams {
     pub conversation_id: String,
     pub expected_revision: u64,

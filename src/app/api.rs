@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 mod agent_view;
 mod agents;
+pub(crate) mod codex_lifecycle;
 mod env;
 mod integrations;
 mod layouts;
@@ -90,6 +91,8 @@ impl App {
         &mut self,
         ev: AppEvent,
     ) -> Vec<crate::app::actions::PaneStateUpdate> {
+        let mut confirmed_codex_exit = self.observe_codex_lifecycle_before_event(&ev);
+        let codex_pty_exit = matches!(&ev, AppEvent::PaneDied { .. });
         if let AppEvent::AgentConversationPromptCompleted {
             conversation_id,
             submitted,
@@ -279,6 +282,9 @@ impl App {
                     self.sync_full_lifecycle_authority_detection_pauses();
                     self.refresh_new_herdr_toast_context_for_update(&update, &previous_toast);
                     self.emit_pane_state_update(&update);
+                    if codex_pty_exit {
+                        self.finish_confirmed_codex_exit(confirmed_codex_exit.take());
+                    }
                 }
                 if self.runtime_exit_action(*pane_id) == RuntimeExitAction::RespawnShell
                     && self.respawn_shell_for_launch_pane(*pane_id, true)
@@ -440,6 +446,10 @@ impl App {
         }
         self.sync_agent_metadata_deadline();
         self.sync_agent_conversations();
+        self.finish_pending_codex_manual_resumes();
+        if pane_updates.iter().any(|update| update.agent_released) {
+            self.finish_confirmed_codex_exit(confirmed_codex_exit);
+        }
         if let Some((
             overlay,
             was_overlay_active,
@@ -1210,6 +1220,16 @@ impl App {
                     crate::agent_inbox::ConversationAction::Reopen,
                 )
             }
+            Method::AgentConversationSnooze(params) => {
+                return self.handle_agent_conversation_snooze(request.id, params)
+            }
+            Method::AgentConversationWake(params) => {
+                return self.handle_agent_conversation_mutation(
+                    request.id,
+                    params,
+                    crate::agent_inbox::ConversationAction::Wake,
+                )
+            }
             Method::AgentConversationResume(params) => {
                 return self.handle_agent_conversation_resume(request.id, params)
             }
@@ -1292,6 +1312,9 @@ impl App {
             }
             Method::PaneReportAgentSession(params) => {
                 return self.handle_pane_report_agent_session(request.id, params);
+            }
+            Method::PaneReportAgentSessionEnd(params) => {
+                return self.handle_pane_report_agent_session_end(request.id, params);
             }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);

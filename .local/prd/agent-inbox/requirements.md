@@ -4,7 +4,7 @@ This is the approved behavior contract. Requirement IDs apply to the custom fork
 
 ## Sections and scope
 
-The final section order is Pinned, Inbox, Working, Snoozed, Settled. Pinned and Inbox start expanded. Working, Snoozed, and Settled start collapsed with counts visible. Empty sections can be omitted, but their saved expansion preferences must survive. The first delivery omits Pinned and Snoozed until their actions and persistence are implemented.
+The final section order is Pinned, Inbox, Working, Snoozed, Settled. Pinned and Inbox start expanded. Working, Snoozed, and Settled start collapsed with counts visible. Empty sections can be omitted, but their saved expansion preferences must survive. Pinned remains deferred. The current Snooze delivery uses a dedicated Snoozed picker in the view selector and retains the three sidebar section preferences for compatibility.
 
 | ID | Requirement |
 | --- | --- |
@@ -50,7 +50,15 @@ For ordinary completion, hold the row in Working for two seconds to avoid flicke
 ## Exclusions and decisions
 
 - Do not add inactivity-based or PR-based automatic settlement in either delivery. Pins therefore have no automatic-settlement policy in this scope.
-- Settle intentionally closes its sole conversation pane after checked persistence. Other pane closures, process exits, and disconnects do not silently settle work. Preserve the conversation and saved location after closure.
+- Settle intentionally closes its sole conversation pane after checked persistence. A matching native Codex shutdown hook followed by release of that same process settles its conversation without closing the remaining shell pane. Other pane closures, process disappearance, and disconnects preserve visible work. Preserve the conversation and saved location after closure.
 - Do not add provider switching, remote orchestration, PR monitoring, scheduling prompts, or automatic worktree cleanup.
 - Do not change status detection to make the sidebar appear correct. Report unsupported semantic signals as capability limits.
 - If duplicate pane attachments resolve to the same authoritative conversation, show one conversation row with an attachment picker. Never choose a target attachment from sidebar position alone.
+
+## Codex shutdown and manual resume
+
+| ID | Requirement |
+| --- | --- |
+| R25 | Settle automatically only after a fresh exact Codex SessionEnd hook and matching process release. Bind evidence to the current process acquisition, native identity, and terminal generation. A crash without the hook, endpoint shutdown, replacement process, stale event, or hook alone does not settle. Keep the remaining shell pane. |
+| R26 | A provider-confirmed resume of the exact settled session reopens it when the process was launched outside Herdr managed restore. Handle either hook/detector ordering and preserve settlement during automatic startup restore. Native confirmation may be lazy until a user turn. |
+| R27 | Add the shutdown report through a separate JSON method. Preserve existing method shapes and frozen codecs. Register and uninstall the new Codex hook without replacing unrelated hooks; require the normal Codex trust flow. |

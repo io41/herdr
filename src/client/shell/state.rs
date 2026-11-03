@@ -342,6 +342,7 @@ pub(super) enum ClientNavigatorFilter {
     Working,
     Idle,
     Done,
+    Snoozed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -529,10 +530,14 @@ pub(super) enum ClientContextMenuAction {
     Disabled,
     AgentView(usize),
     AgentSection(usize),
+    SnoozedConversations,
     ConversationOpen(usize),
     ConversationOpenResumeTarget,
     ConversationLocation(usize),
     ConversationSettle,
+    ConversationSnooze,
+    ConversationSnoozeDuration(u64),
+    ConversationWake,
     ConversationResume,
     ConversationChooseLocation,
     Rename,
@@ -557,6 +562,11 @@ pub(super) enum ClientContextMenuTarget {
     AgentViews {
         selected: usize,
         expanded: [bool; 3],
+        snoozed_count: usize,
+    },
+    ConversationSnooze {
+        endpoint_id: ClientEndpointId,
+        record: Box<crate::agent_inbox::ConversationRecord>,
     },
     ConversationLocations {
         endpoint_id: ClientEndpointId,
@@ -1004,6 +1014,7 @@ pub(crate) struct ClientShellState {
     pub(super) queued_notifications: VecDeque<ClientVisibleNotification>,
     pub(super) endpoint_notice_seen: HashSet<ClientEndpointNoticeKey>,
     pub(super) visible_endpoint_notice: Option<ClientVisibleEndpointNotice>,
+    pub(super) snooze_countdown_minute: Option<u64>,
     pub(super) outer_focused: Option<bool>,
     pub(super) ascii_input_source_active: bool,
     pub(super) pending_input_source_changes: Vec<bool>,
@@ -1179,6 +1190,7 @@ impl ClientShellState {
             queued_notifications: VecDeque::new(),
             endpoint_notice_seen: HashSet::new(),
             visible_endpoint_notice: None,
+            snooze_countdown_minute: None,
             outer_focused: None,
             ascii_input_source_active: false,
             pending_input_source_changes: Vec::new(),

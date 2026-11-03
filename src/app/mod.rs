@@ -111,6 +111,12 @@ pub struct App {
     pub(crate) agent_inbox_deadline: Option<Instant>,
     pub(crate) agent_inbox_error: Option<String>,
     pub(crate) pending_conversation_prompts: HashMap<String, usize>,
+    pub(crate) pending_codex_session_ends:
+        HashMap<crate::terminal::TerminalId, api::codex_lifecycle::PendingCodexSessionEnd>,
+    pub(crate) codex_process_origins: HashMap<crate::terminal::TerminalId, bool>,
+    pub(crate) codex_process_acquisitions: HashMap<crate::terminal::TerminalId, u64>,
+    pub(crate) pending_codex_manual_resumes:
+        HashMap<crate::terminal::TerminalId, api::codex_lifecycle::PendingCodexManualResume>,
     pub(crate) pixel_mouse_available: bool,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
@@ -639,6 +645,10 @@ impl App {
             agent_inbox_deadline: None,
             agent_inbox_error: None,
             pending_conversation_prompts: HashMap::new(),
+            pending_codex_session_ends: HashMap::new(),
+            codex_process_origins: HashMap::new(),
+            codex_process_acquisitions: HashMap::new(),
+            pending_codex_manual_resumes: HashMap::new(),
             plugin_installation_leases,
             plugin_installation_cleanup_allowed,
             config_diagnostic_deadline: None,

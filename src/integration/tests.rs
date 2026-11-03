@@ -1435,7 +1435,7 @@ fn codex_v2_integration_status_is_outdated() {
 
     assert_eq!(codex.path, hook_path);
     assert_eq!(codex.installed_version, Some(2));
-    assert_eq!(codex.expected_version, 10);
+    assert_eq!(codex.expected_version, CODEX_INTEGRATION_VERSION);
     assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
     std::env::remove_var("HOME");
@@ -1466,6 +1466,11 @@ fn install_codex_writes_hook_and_updates_hooks_and_config() {
         .as_str()
         .unwrap()
         .contains(" session"));
+    assert!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .contains(" session"));
+    assert_eq!(hooks["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3);
     assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
@@ -1521,6 +1526,7 @@ fn install_codex_is_idempotent_for_hook_entries_and_feature_flag() {
     let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
     assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    assert_eq!(hooks["hooks"]["SessionEnd"].as_array().unwrap().len(), 1);
     assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
     assert!(hooks["hooks"].get("PreToolUse").is_none());
     assert!(hooks["hooks"].get("PermissionRequest").is_none());
@@ -1614,6 +1620,10 @@ fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
     let hooks = serde_json::json!({
         "hooks": {
             "SessionStart": [{"hooks": [{"type": "command", "command": format!("bash '{}' idle", hook_path.display()), "timeout": 10}]}],
+            "SessionEnd": [{"hooks": [
+                {"type": "command", "command": hook_command(&hook_path, Some("session")), "timeout": 3},
+                {"type": "command", "command": "echo keep-end", "timeout": 3}
+            ]}],
             "UserPromptSubmit": [{"hooks": [
                 {"type": "command", "command": format!("bash '{}' working", hook_path.display()), "timeout": 10},
                 {"type": "command", "command": "echo keep", "timeout": 10}
@@ -1659,6 +1669,10 @@ fn uninstall_codex_removes_herdr_hooks_and_leaves_config_alone() {
     assert_eq!(
         hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
         "echo keep"
+    );
+    assert_eq!(
+        hooks["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+        "echo keep-end"
     );
     assert!(config.contains("hooks = true"));
     assert!(config.contains("other = true"));

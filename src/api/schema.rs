@@ -130,6 +130,7 @@ operations::define_operations! {
     PaneRead(PaneReadParams) => "pane.read", false, false;
     PaneReportAgent(PaneReportAgentParams) => "pane.report_agent", true, false;
     PaneReportAgentSession(PaneReportAgentSessionParams) => "pane.report_agent_session", true, false;
+    PaneReportAgentSessionEnd(PaneReportAgentSessionEndParams) => "pane.report_agent_session_end", true, false;
     PaneReportMetadata(PaneReportMetadataParams) => "pane.report_metadata", true, false;
     PaneClearAgentAuthority(PaneClearAgentAuthorityParams) => "pane.clear_agent_authority", true, false;
     PaneReleaseAgent(PaneReleaseAgentParams) => "pane.release_agent", true, false;
@@ -152,6 +153,8 @@ operations::define_operations! {
     PluginPaneOpen(PluginPaneOpenParams) => "plugin.pane.open", true, false;
     PluginPaneFocus(PluginPaneFocusParams) => "plugin.pane.focus", true, false;
     PluginPaneClose(PluginPaneCloseParams) => "plugin.pane.close", true, false;
+    AgentConversationSnooze(AgentConversationSnoozeParams) => "agent.conversation.snooze", true, true;
+    AgentConversationWake(AgentConversationMutationParams) => "agent.conversation.wake", true, true;
 }
 
 #[cfg(test)]

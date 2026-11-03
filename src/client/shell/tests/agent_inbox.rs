@@ -44,6 +44,8 @@ fn inbox(records: Vec<ConversationRecord>) -> ClientShellState {
                 "reopen",
                 "resume",
                 "open",
+                "snooze",
+                "wake",
             ]
             .map(|action| format!("agent.conversation.{action}"))
             .to_vec(),
@@ -978,7 +980,7 @@ fn inbox_menus_use_one_restore_and_disable_unsafe_or_unsupported_settle() {
     let methods = state.endpoints[0].methods.as_ref().unwrap();
     let closed = record("closed", ConversationSection::Settled, false);
     let items = conversation_menu_items(&closed, true, methods);
-    assert_eq!(items.len(), 1);
+    assert_eq!(items.len(), 2);
     assert_eq!(items[0].action, ClientContextMenuAction::ConversationResume);
     assert_eq!(items[0].label, "Restore  r");
     let mut blocked = record("blocked", ConversationSection::Inbox, true);
@@ -1046,4 +1048,324 @@ fn inbox_narrow_closed_row_keeps_every_last_known_location_component() {
         super::super::agent_inbox::row_detail(&rows[0], 80),
         "codex · Last known: cwd / 1 / Pane 1"
     );
+}
+
+#[test]
+fn snoozed_conversations_hide_from_sections_but_remain_in_all_and_recover_when_uncertain() {
+    let mut sleeping = record("sleeping", ConversationSection::Inbox, true);
+    sleeping.snoozed_until_ms = Some(super::super::agent_inbox::now_ms() + 3_600_000);
+    let mut state = inbox(vec![sleeping]);
+    state.agent_inbox_expanded = [true; 3];
+    assert!(state.visible_conversations().is_empty());
+    state.open_navigator_overlay();
+    let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_ref() else {
+        panic!()
+    };
+    let rows =
+        render::client_navigator_rows(&state.endpoints, &state.active_endpoint_id, navigator);
+    assert!(rows
+        .iter()
+        .any(|row| row.label == "sleeping" && row.meta.contains("Wakes in")));
+    for section in [ConversationSection::Working, ConversationSection::Settled] {
+        state.endpoints[0]
+            .conversations
+            .as_mut()
+            .unwrap()
+            .projection
+            .conversations[0]
+            .section = section;
+        assert!(state.visible_conversations().is_empty());
+    }
+    state.endpoints[0].status = ClientEndpointStatus::Reconnecting;
+    assert_eq!(state.visible_conversations().len(), 1);
+    state.endpoints[0].status = ClientEndpointStatus::Online;
+    state.endpoints[0]
+        .conversations
+        .as_mut()
+        .unwrap()
+        .projection
+        .recovery_error = Some("cannot read".into());
+    assert_eq!(state.visible_conversations().len(), 1);
+    state.endpoints[0]
+        .conversations
+        .as_mut()
+        .unwrap()
+        .projection
+        .recovery_error = None;
+    for execution in [ExecutionState::Unknown, ExecutionState::Unavailable] {
+        state.endpoints[0]
+            .conversations
+            .as_mut()
+            .unwrap()
+            .projection
+            .conversations[0]
+            .execution = execution;
+        assert_eq!(state.visible_conversations().len(), 1);
+    }
+    let sleeping = &mut state.endpoints[0]
+        .conversations
+        .as_mut()
+        .unwrap()
+        .projection
+        .conversations[0];
+    sleeping.execution = ExecutionState::Idle;
+    sleeping.snoozed_until_ms = Some(1);
+    assert!(state.visible_conversations().is_empty());
+    state.open_agent_view_selector(&mut ClientShellInput::default());
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!()
+    };
+    assert!(menu.items().iter().any(|item| item.label == "Snoozed… (1)"));
+    let mut awake = state.endpoints[0]
+        .conversations
+        .as_ref()
+        .unwrap()
+        .projection
+        .conversations[0]
+        .clone();
+    awake.snoozed_until_ms = None;
+    assert!(state.set_endpoint_agent_conversations(
+        &ClientEndpointId::Local,
+        None,
+        projection("boot-1", 2, vec![awake])
+    ));
+    assert_eq!(state.visible_conversations().len(), 1);
+}
+
+#[test]
+fn snoozed_selector_filters_history_and_enter_opens_actions() {
+    let mut sleeping = record("sleeping", ConversationSection::Inbox, true);
+    sleeping.snoozed_until_ms = Some(super::super::agent_inbox::now_ms() + 3_600_000);
+    let mut state = inbox(vec![
+        sleeping,
+        record("awake", ConversationSection::Inbox, false),
+    ]);
+    let mut outcome = ClientShellInput::default();
+    state.open_agent_view_selector(&mut outcome);
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!()
+    };
+    let index = menu
+        .items()
+        .iter()
+        .position(|item| item.label == "Snoozed… (1)")
+        .unwrap();
+    state.activate_context_menu_item(index, &mut outcome);
+    let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_ref() else {
+        panic!()
+    };
+    assert_eq!(navigator.filter, Some(ClientNavigatorFilter::Snoozed));
+    let rows =
+        render::client_navigator_rows(&state.endpoints, &state.active_endpoint_id, navigator);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label, "sleeping");
+    let accepted = press(&mut state, KeyCode::Enter);
+    assert!(accepted.actions.is_empty());
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!()
+    };
+    assert!(menu
+        .items()
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::ConversationWake));
+    assert!(
+        super::super::agent_inbox::conversation_details(&menu.target)
+            .iter()
+            .any(|line| line.contains("Wakes in"))
+    );
+}
+
+#[test]
+fn snooze_durations_and_wake_use_owning_endpoint_and_record_revision() {
+    let remote = ClientEndpointId::Ssh(
+        crate::client::endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+    );
+    for (index, duration_ms) in [3_600_000, 14_400_000, 86_400_000].into_iter().enumerate() {
+        let sleeping = record("remote-task", ConversationSection::Inbox, true);
+        let mut state = inbox(vec![sleeping]);
+        state.endpoints[0].endpoint_id = remote.clone();
+        state.endpoints[0].snapshot_generation = Some(7);
+        state.endpoints[0]
+            .conversations
+            .as_mut()
+            .unwrap()
+            .generation = Some(7);
+        let mut opened = ClientShellInput::default();
+        state.open_conversation(remote.clone(), "remote-task".into(), true, &mut opened);
+        assert!(press(&mut state, KeyCode::Char('z')).actions.is_empty());
+        assert!(
+            matches!(state.overlay, Some(ClientShellOverlay::ContextMenu(ref menu)) if matches!(menu.target, ClientContextMenuTarget::ConversationSnooze { .. }))
+        );
+        let mut outcome = ClientShellInput::default();
+        state.activate_context_menu_item(index, &mut outcome);
+        let [ClientShellAction::Endpoint {
+            endpoint_id,
+            request,
+            ..
+        }] = &outcome.actions[..]
+        else {
+            panic!()
+        };
+        assert_eq!(endpoint_id, &remote);
+        assert!(
+            matches!(&request.method, crate::api::schema::Method::AgentConversationSnooze(params) if params.duration_ms == duration_ms && params.expected_revision == 1 && params.conversation_id == "remote-task")
+        );
+        assert!(state.conversation_request_is_endpoint_qualified(&request.id, &remote, 7));
+        assert!(!state.conversation_request_is_endpoint_qualified(
+            &request.id,
+            &ClientEndpointId::Local,
+            7
+        ));
+        assert!(!state.conversation_request_is_endpoint_qualified(&request.id, &remote, 8));
+        state.endpoints[0]
+            .conversations
+            .as_mut()
+            .unwrap()
+            .projection
+            .conversations[0]
+            .snoozed_until_ms = Some(super::super::agent_inbox::now_ms() + duration_ms);
+        state.open_conversation(remote.clone(), "remote-task".into(), true, &mut opened);
+        let wake = press(&mut state, KeyCode::Char('w'));
+        assert!(
+            matches!(&wake.actions[..], [ClientShellAction::Endpoint { endpoint_id, request, .. }] if endpoint_id == &remote && matches!(&request.method, crate::api::schema::Method::AgentConversationWake(params) if params.expected_revision == 1 && params.conversation_id == "remote-task"))
+        );
+    }
+}
+
+#[test]
+fn disabled_settle_explains_pending_draft_and_keeps_menu_open() {
+    let mut pending = record("pending", ConversationSection::Inbox, true);
+    pending.queued_human_work = true;
+    let mut state = inbox(vec![pending]);
+    state.open_conversation(
+        ClientEndpointId::Local,
+        "pending".into(),
+        true,
+        &mut ClientShellInput::default(),
+    );
+    let outcome = press(&mut state, KeyCode::Char('s'));
+    assert!(outcome.actions.is_empty());
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::ContextMenu(_))
+    ));
+    let notice = state
+        .visible_endpoint_notice
+        .as_ref()
+        .expect("disabled action must explain why");
+    assert_eq!(notice.title, "Action unavailable");
+    assert!(notice.body.contains("pending input or draft"));
+    let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+        panic!()
+    };
+    assert!(menu.items()[menu.highlighted]
+        .label
+        .starts_with("Settle  s"));
+    let snooze = press(&mut state, KeyCode::Char('z'));
+    assert!(snooze.actions.is_empty());
+    assert!(
+        matches!(state.overlay, Some(ClientShellOverlay::ContextMenu(ref menu)) if matches!(menu.target, ClientContextMenuTarget::ConversationSnooze { .. }))
+    );
+    let mut outcome = ClientShellInput::default();
+    state.activate_context_menu_item(0, &mut outcome);
+    assert!(
+        matches!(&outcome.actions[..], [ClientShellAction::Endpoint { request, .. }] if matches!(request.method, crate::api::schema::Method::AgentConversationSnooze(_)))
+    );
+}
+
+#[test]
+fn snooze_and_wake_capabilities_disable_only_the_missing_action() {
+    let mut sleeping = record("sleeping", ConversationSection::Inbox, true);
+    sleeping.snoozed_until_ms = Some(super::super::agent_inbox::now_ms() + 3_600_000);
+    for missing in ["agent.conversation.snooze", "agent.conversation.wake"] {
+        let mut state = inbox(vec![sleeping.clone()]);
+        state.endpoints[0].methods.as_mut().unwrap().remove(missing);
+        state.open_conversation(
+            ClientEndpointId::Local,
+            "sleeping".into(),
+            true,
+            &mut ClientShellInput::default(),
+        );
+        let outcome = press(
+            &mut state,
+            KeyCode::Char(if missing.ends_with("snooze") {
+                'z'
+            } else {
+                'w'
+            }),
+        );
+        assert!(outcome.actions.is_empty());
+        assert!(state
+            .visible_endpoint_notice
+            .as_ref()
+            .unwrap()
+            .body
+            .contains("update endpoint"));
+        let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
+            panic!()
+        };
+        let other = if missing.ends_with("snooze") {
+            ClientContextMenuAction::ConversationWake
+        } else {
+            ClientContextMenuAction::ConversationSnooze
+        };
+        assert!(menu.items().iter().any(|item| item.action == other));
+        press(&mut state, KeyCode::Esc);
+        let typing = state.handle_input_bytes(b"zw");
+        assert!(!typing.requests.is_empty());
+        assert!(typing.actions.is_empty());
+        assert!(state.visible_endpoint_notice.is_some());
+    }
+}
+
+#[test]
+fn snooze_countdown_repaints_each_minute_only_while_a_deadline_is_displayed() {
+    let mut sleeping = record("sleeping", ConversationSection::Inbox, true);
+    sleeping.snoozed_until_ms = Some(3_600_000);
+    let mut state = inbox(vec![sleeping]);
+    assert!(!state.tick_snooze_countdown_at(0));
+    assert!(!state.tick_snooze_countdown_at(60_000));
+    state.open_conversation(
+        ClientEndpointId::Local,
+        "sleeping".into(),
+        true,
+        &mut ClientShellInput::default(),
+    );
+    assert!(!state.tick_snooze_countdown_at(60_001));
+    assert!(state.tick_snooze_countdown_at(120_000));
+    assert!(!state.tick_snooze_countdown_at(120_001));
+    state.overlay = None;
+    assert!(!state.tick_snooze_countdown_at(180_000));
+    state.open_navigator_overlay();
+    assert!(!state.tick_snooze_countdown_at(240_000));
+    let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() else {
+        panic!()
+    };
+    navigator.filter = Some(ClientNavigatorFilter::Snoozed);
+    assert!(state.tick_snooze_countdown_at(300_000));
+    assert!(!state.tick_snooze_countdown_at(300_001));
+    let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() else {
+        panic!()
+    };
+    navigator.query = TextEditor::new("no matching conversations", false);
+    assert!(!state.tick_snooze_countdown_at(360_000));
+    let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() else {
+        panic!()
+    };
+    navigator.query = TextEditor::default();
+    state.endpoints[0]
+        .conversations
+        .as_mut()
+        .unwrap()
+        .projection
+        .conversations[0]
+        .snoozed_until_ms = None;
+    assert!(!state.tick_snooze_countdown_at(420_000));
+    state.open_conversation(
+        ClientEndpointId::Local,
+        "sleeping".into(),
+        true,
+        &mut ClientShellInput::default(),
+    );
+    assert!(!state.tick_snooze_countdown_at(480_000));
 }

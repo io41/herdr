@@ -445,6 +445,26 @@ crate::cli::projection::cli_params! {
 
 crate::cli::projection::cli_params! {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct PaneReportAgentSessionEndParams => PaneReportSessionEndProjection {
+        pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
+        pub source: String => Field::new(String::new()).input(binding::source()),
+        pub agent: String => Field::new(String::new()).input(binding::text("agent", "LABEL").required()),
+        pub seq: u64 => Field::new(0).input(Input::value("seq", "N", |slot, value| {
+            *slot = crate::cli::parse_u64_flag("--seq", value)?;
+            Ok(())
+        }).required()),
+        pub reported_at_unix_ms: u64 => Field::new(0).input(Input::value("reported-at-unix-ms", "N", |slot, value| {
+            *slot = crate::cli::parse_u64_flag("--reported-at-unix-ms", value)?;
+            Ok(())
+        }).required()),
+        pub agent_session_id: String => Field::new(String::new()).input(binding::text("agent-session-id", "ID").required()),
+        pub transcript_path: String => Field::new(String::new()).input(binding::text("transcript-path", "PATH").required()),
+        pub reason: String => Field::new(String::new()).input(binding::text("reason", "REASON").required()),
+    }
+}
+
+crate::cli::projection::cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
     pub struct PaneReportMetadataParams => PaneMetadataProjection {
         pub pane_id: String => Field::new(String::new()).input(binding::pane_id()),
         pub source: String => Field::new(String::new()).input(binding::source()),

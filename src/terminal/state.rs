@@ -1992,6 +1992,25 @@ impl TerminalState {
         }
     }
 
+    /// SessionEnd confirms a restored identity even when SessionStart has not run yet.
+    pub(crate) fn accept_codex_session_end(
+        &mut self,
+        session: &crate::agent_resume::PersistedAgentSession,
+        seq: u64,
+    ) -> bool {
+        if session.source != "herdr:codex"
+            || session.agent != "codex"
+            || self.detected_agent != Some(Agent::Codex)
+            || self.recent_agent_process_exit.is_some()
+            || self.persisted_agent_session.as_ref() != Some(session)
+            || !self.accept_hook_report(&session.source, Some(seq))
+        {
+            return false;
+        }
+        self.provider_reported_session = Some(session.clone());
+        true
+    }
+
     /// Same ordering rule as lifecycle reports, evaluated before the report is
     /// applied so a duplicate cannot pass as the report that was just accepted.
     pub fn hook_report_is_newer(&self, source: &str, seq: Option<u64>) -> bool {

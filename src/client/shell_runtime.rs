@@ -27,6 +27,8 @@ pub(super) fn dispatch_client_shell_actions(
                         | crate::api::schema::Method::AgentConversationReopen(_)
                         | crate::api::schema::Method::AgentConversationResume(_)
                         | crate::api::schema::Method::AgentConversationRestore(_)
+                        | crate::api::schema::Method::AgentConversationSnooze(_)
+                        | crate::api::schema::Method::AgentConversationWake(_)
                 );
                 if let Some(connection) = endpoints.connection(&endpoint_id).filter(|connection| {
                     conversation
@@ -1044,6 +1046,91 @@ mod tests {
         assert!(local_sent.lock().unwrap().is_empty());
         assert_eq!(endpoints.active_id(), &endpoint::ClientEndpointId::Local);
         assert!(!endpoints.connection(&remote).unwrap().surface_active);
+    }
+
+    #[test]
+    fn inactive_snooze_and_wake_stay_endpoint_qualified_without_activation() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<ClientMessage>>>);
+        impl endpoint::EndpointTransport for Capture {
+            fn send(&mut self, message: &ClientMessage) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok(())
+            }
+        }
+        use crate::api::schema::{
+            AgentConversationMutationParams, AgentConversationSnoozeParams, Method,
+        };
+        for method in [
+            Method::AgentConversationSnooze(AgentConversationSnoozeParams {
+                conversation_id: "task".into(),
+                expected_revision: 4,
+                duration_ms: 3_600_000,
+            }),
+            Method::AgentConversationWake(AgentConversationMutationParams {
+                conversation_id: "task".into(),
+                expected_revision: 5,
+            }),
+        ] {
+            let remote = endpoint::ClientEndpointId::Ssh(
+                endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            );
+            let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let local_sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut endpoints =
+                endpoint::EndpointRegistry::new(Capture(local_sent.clone()), 1, Default::default());
+            endpoints.insert(
+                remote.clone(),
+                Capture(sent.clone()),
+                7,
+                Default::default(),
+                false,
+            );
+            let mut commands = endpoint_commands::EndpointCommands::default();
+            let action = shell::ClientShellAction::Endpoint {
+                endpoint_id: remote.clone(),
+                boot_id: "remote-boot".into(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "snooze-or-wake".into(),
+                    method,
+                }),
+            };
+            let mut scheduled = None;
+            let (replay, repaint) = dispatch_client_shell_actions(
+                vec![action],
+                &mut commands,
+                &mut endpoints,
+                None,
+                &mut Vec::new(),
+                &mut scheduled,
+            )
+            .unwrap();
+            assert!(replay.is_empty());
+            assert!(!repaint);
+            assert!(scheduled.is_none());
+            assert_eq!(endpoints.active_id(), &endpoint::ClientEndpointId::Local);
+            assert!(!endpoints.connection(&remote).unwrap().surface_active);
+            assert!(local_sent.lock().unwrap().is_empty());
+            let captured = sent.lock().unwrap();
+            let [ClientMessage::ClientShellEndpointRequest { boot_id, request }] = &captured[..]
+            else {
+                panic!()
+            };
+            assert_eq!(boot_id, "remote-boot");
+            let request: crate::api::schema::Request = serde_json::from_str(request).unwrap();
+            assert!(matches!(
+                request.method,
+                Method::AgentConversationSnooze(_) | Method::AgentConversationWake(_)
+            ));
+            assert!(commands.accepts_response(&remote, 7, "remote-boot", &request.id));
+            assert!(!commands.accepts_response(
+                &endpoint::ClientEndpointId::Local,
+                7,
+                "remote-boot",
+                &request.id
+            ));
+            assert!(!commands.accepts_response(&remote, 8, "remote-boot", &request.id));
+        }
     }
 
     #[test]

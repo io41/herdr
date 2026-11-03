@@ -1,6 +1,6 @@
 # Agent inbox design
 
-The type sketches below describe the behavior contract. First-delivery conversation methods are implemented; pins, snooze, and undo remain design targets. Revalidate source locations against the implementation before changing it.
+The type sketches below describe the behavior contract. First-delivery conversation methods are implemented; pins and undo remain design targets. Revalidate source locations against the implementation before changing it.
 
 ## State ownership
 
@@ -88,3 +88,12 @@ Before close, serialize a checked session checkpoint with terminal-generation id
 Restore prioritizes durable identity, then unique saved Space and displayed tab names as destination preferences. Names never identify a conversation. Reuse existing containers, create only missing containers, and focus the exact selected or newly launched pane. Missing directories and ambiguous destinations are exceptional recovery prompts rather than permanent menu options.
 
 Meaningful row titles and location breadcrumbs use existing metadata and saved context. One real view selector replaces the overdrawn legacy header. Action shortcuts are modal and do not intercept ordinary agent input.
+
+
+## November 3 Snooze and Codex lifecycle extension
+
+Snooze adds one optional persisted `snoozed_until_ms` field. Existing disposition and section enum values remain unchanged so older JSON clients can still decode records. The owning server accepts a relative duration, saves an absolute deadline, and reuses its lifecycle timer for expiry with no TUI attached. The client filters snoozed rows and completion notifications, retains them in All, and exposes a Snoozed picker without changing the three expansion preferences. Local time formats countdowns; only server state ends a snooze.
+
+The native shutdown hook uses a separate `pane.report_agent_session_end` method. Transient evidence binds the exact native session and terminal to the current process acquisition and a short producer-time window. It is consumed only by that process releasing the terminal, discarded on replacement or shutdown, and never restored from disk. This combines a provider shutdown signal with runtime evidence without claiming an exit status of zero. A separate native-resume check distinguishes user-owned processes from Herdr startup restore before reopening a settled record.
+
+Settle retains its strict input guard. Plain Escape cannot create a new draft, and confirmed runtime disappearance clears stale queued input. Unsupported actions remain visible with a reason and show a notice when attempted. These fixes do not discard an existing draft or submission.

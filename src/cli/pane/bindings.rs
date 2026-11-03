@@ -710,6 +710,18 @@ pub(super) const LEAVES: &[Leaf] = &[
         },
     },
     Leaf {
+        name: "report-agent-session-end",
+        about: "Report native pane agent session shutdown",
+        id: "cli:request",
+        output: Output::Quiet,
+        arguments: PaneReportSessionEndProjection::arguments,
+        method: |matches| {
+            let mut params = PaneReportSessionEndProjection::from_matches(matches)?;
+            params.source = super::source(params.source)?;
+            Ok(Method::PaneReportAgentSessionEnd(params))
+        },
+    },
+    Leaf {
         name: "release-agent",
         about: "Release pane agent lifecycle authority",
         id: "cli:request",

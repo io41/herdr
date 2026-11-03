@@ -191,6 +191,30 @@ fn claude_hook_ignores_cursor_compatibility_payloads() {
 }
 
 #[test]
+fn codex_hook_reports_native_end_through_a_separate_method() {
+    let request = run_codex_hook(
+        "session",
+        r#"{"hook_event_name":"SessionEnd","session_id":"codex-session","transcript_path":"/tmp/codex-session.jsonl","reason":"other"}"#,
+    ).expect("persisted root end should report");
+    assert_eq!(request["method"], "pane.report_agent_session_end");
+    assert_eq!(request["params"]["agent_session_id"], "codex-session");
+    assert_eq!(request["params"]["reason"], "other");
+    assert!(request["params"].get("session_start_source").is_none());
+    for payload in [
+        r#"{"hook_event_name":"SessionEnd","session_id":"codex-session","transcript_path":null,"reason":"other"}"#,
+        r#"{"hook_event_name":"SessionEnd","session_id":"codex-session","transcript_path":"/tmp/codex-session.jsonl","reason":"user_exit"}"#,
+        r#"{"hook_event_name":"SessionEnd","session_id":"codex-session","transcript_path":"/tmp/codex-session.jsonl"}"#,
+    ] {
+        assert!(run_codex_hook("session", payload).is_none());
+    }
+    assert!(run_shell_hook_with_env(
+        "src/integration/assets/codex/herdr-agent-state.sh", &["session"],
+        r#"{"hook_event_name":"SessionEnd","session_id":"nested-session","transcript_path":"/tmp/codex-session.jsonl","reason":"other"}"#,
+        &[("CODEX_THREAD_ID", "parent-session")],
+    ).is_none());
+}
+
+#[test]
 fn codex_hook_reports_persisted_root_session_and_ignores_ephemeral_or_nested_sessions() {
     let request = run_codex_hook(
         "session",

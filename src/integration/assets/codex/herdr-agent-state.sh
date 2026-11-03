@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codex
-# HERDR_INTEGRATION_VERSION=10
+# HERDR_INTEGRATION_VERSION=11
 
 set -eu
 
@@ -49,7 +49,7 @@ if hook_input_file:
         hook_input = {}
 
 hook_event_name = str(hook_input.get("hook_event_name") or "")
-if hook_event_name and hook_event_name != "SessionStart":
+if hook_event_name and hook_event_name not in ("SessionStart", "SessionEnd"):
     raise SystemExit(0)
 
 request_id = f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}"
@@ -73,11 +73,17 @@ if agent_session_id:
         "seq": report_seq,
         "agent_session_id": agent_session_id,
     }
-    if session_start_source:
+    if hook_event_name == "SessionEnd":
+        if hook_input.get("reason") != "other":
+            raise SystemExit(0)
+        params["reason"] = "other"
+        params["transcript_path"] = transcript_path
+        params["reported_at_unix_ms"] = int(time.time() * 1000)
+    elif session_start_source:
         params["session_start_source"] = session_start_source
     request = {
         "id": request_id,
-        "method": "pane.report_agent_session",
+        "method": "pane.report_agent_session_end" if hook_event_name == "SessionEnd" else "pane.report_agent_session",
         "params": params,
     }
 else:

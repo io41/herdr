@@ -35,7 +35,7 @@ Deliver the first release before adding timed Snooze, pins, and Undo. Each work 
 | Close pane, restart, Resume | Retain the conversation and resume its exact provider session in the saved location. |
 | Original tab, Space, or directory removed | Reuse uniquely matching existing names, create only missing containers, and prompt only for a missing directory or ambiguous destination. Never silently use an unrelated tab or create a worktree. |
 | Resume timeout after process launch | Show Status unknown in Inbox and reconcile attachments before retry. Never launch a duplicate automatically. |
-| Closed conversation with pending attention | Keep it in Inbox marked Closed; closure never settles it. |
+| Closed conversation without verified shutdown evidence | Keep it in Inbox marked Closed. Process disappearance alone never settles it. |
 | Browse settled closed conversation | Show saved details without starting an agent or changing disposition. |
 | Second delivery: snooze through completion | Keep hidden until deadline or a supported early-wake event. |
 | Second delivery: expiry while detached or restarted | Wake once after restoring the deadline, with no TUI required. |
@@ -61,3 +61,14 @@ Implementation requires the checks above in addition to whitespace, relative-lin
 - Settle refuses queued/unconfirmed input, active work, unresolved requests, ambiguous attachments, and failed persistence without killing a process.
 - Crash-before-debounce recovery prunes exact retired generations before spawning agents, keeps replacements and legacy nonclosing settlement, and preserves valid surviving screen history.
 - Restore reuses existing Space/tab names when old durable IDs are unavailable, creates only missing containers, and focuses the exact restored pane before success is reported to the requesting client.
+
+
+## Current extension acceptance
+
+- Snooze offers 1 hour, 4 hours, and 24 hours, preserves running work and drafts, and suppresses ordinary completion notifications.
+- Snoozed conversations remain accessible in All and a dedicated picker, with Wake and a visible countdown. Only the server expires them.
+- Expiry, restart, stale Wake, persistence failure, fresh attention, and repeated blocked status have reducer coverage.
+- Plain Escape does not create a draft. Runtime disappearance clears stale queued work. Disabled Settle gives visible feedback.
+- Exact native shutdown plus matching process release settles one conversation. Missing, delayed, replaced, duplicate, shutdown-time, and unconfirmed evidence cannot settle another process.
+- Manual exact resume reopens after provider confirmation in either event order. Herdr managed startup restore preserves settlement.
+- Chezmoi maintains durable configuration and helper sources for both profiles while excluding runtime state and credentials.

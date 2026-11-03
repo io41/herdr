@@ -71,3 +71,31 @@ Normal gruvbox settings, custom bindings, widgets, Palette, pane movement, Latch
 Automatic settlement on Codex exit and automatic reopening on manual resume remain deferred. Codex 0.166's documented SessionEnd reason is `other`, and SessionStart cannot establish manual intent. Snooze and pins remain outside this delivery.
 
 Independent GPT-6.1-Sol high review found and reproduced an acknowledgement-ordering defect. Actual writer delivery receipts and delayed-receiver regressions address it. The follow-up safety review found no supported data-loss issue. A separate prose review checked the fork guide.
+
+
+## November 3 follow-up: Settle guard, Snooze, and native shutdown
+
+Live inspection reproduced two idle conversations, Update DB obs docs and --tui flag scope, with `queued_human_work=true`. The DB docs conversation retained that flag after the user quit Codex and the record became Closed with no attachments. No Settle API request reached the server when the disabled menu item was selected. The exact earlier input event was not logged, so it cannot be attributed to a particular key.
+
+The exact-source input harness fails before the plain-Escape fix and passes afterward while preserving existing drafts and submissions. Closed-runtime reconciliation and registry loading now clear stale queued work. Disabled Settle reports pending input separately from active execution and displays a notice when attempted.
+
+Snooze uses an optional JSON deadline and unchanged disposition/section enum values. The server owns duration validation, persistence, expiry, and early wake. The client hides snoozed rows and completion notifications, retains All navigation, exposes a Snoozed picker and Wake, and uses local time only for countdown text. A visible countdown repaints at minute boundaries.
+
+Codex integration version 11 follows version 10 in released v0.9.5. Its separate `pane.report_agent_session_end` method requires the exact native ID, transcript path, sequence, and producer timestamp. Transient end evidence is bound to current process acquisition and matched release. Shutdown, stale producer data, replacement processes, duplicate attachments, and absent native end evidence cannot settle other work. Manual-resume evidence handles either hook/detector ordering, survives transient write failures, and yields to later successful explicit Settle or Snooze. The remaining shell pane stays open.
+
+Validation uses pinned Rust 1.96.1 and Zig 0.16.0:
+
+- The broad affected-path run executes 1,132 tests: 1,131 pass and one old test expects integration version 10. Replacing that expectation with the version constant is followed by a 200-test integration, lifecycle, and Snooze run with 200 passing. These runs overlap and are not 1,332 unique tests. Logs: `inbox-lifecycle-focused-final.log` and `inbox-lifecycle-corrections.log` in `/private/tmp/herdr-toolchain/`.
+- All 14 native lifecycle route tests pass, including real persistence obstruction and recovery. An earlier fixture backdated process acquisition before the previous exit and correctly triggered stale-process protection. The fixture now uses fresh observations and waits for a later producer millisecond; production guards are unchanged.
+- Final `just lint` passes. Generated schema passes. Frozen codecs, generation-1 method fixtures, and bundled stable skill are unchanged.
+- Required `just check` passes formatting and Clippy, then stops on the known `/var/tmp` graphics-directory permission failure. Maintenance has 168 passing cases and 10 release-test setup errors for the same unwritable directory. UI hot-path checks, all three integration asset suites, and documentation contracts pass. Windows validation remains blocked by the missing SDK.
+- `/private/tmp/herdr-toolchain/snooze-api-smoke.py` passes real JSON API Snooze, explicit Wake, server restart persistence, and deadline expiry without a TUI. It uses a synthetic native history record and no provider credentials.
+- The real 140x40 TUI fixture passes sidebar width 36, hidden Inbox membership, Snoozed count and picker, countdown, actual z-to-duration Snooze, actual w-to-Wake, and corresponding server state. Captures and cleanup evidence are under `/private/tmp/herdr-toolchain/snooze-tui-yvr74s_p/`.
+- The final shell hook fixture verifies unchanged SessionStart reporting, dedicated SessionEnd reporting, bounded producer timestamps, and rejection of ephemeral, nested, unsupported, or unknown-reason input. Evidence: `/private/tmp/herdr-codex-hook-fixture-result.txt`.
+- Fixed 120x40 debug rendering measures 644,188 ns/frame for one pane and 830,650 for fifteen, a 1.29x within-run ratio. This is not a controlled comparison with a different build or earlier host load.
+
+The live inbox configuration is set to 36 columns and its reload returns applied with no diagnostics. No saved manual width overrides it. Chezmoi recursively verifies both profiles and both inbox launchers, with empty targeted diffs. Normal durable configuration hashes remain unchanged. Inbox templates depend on existing uncommitted normal Latch sources; all these dotfile additions remain in the source working tree rather than a separate incomplete Git commit. The existing rendered Latch tests have 65 passes and one cold-PTY startup latency failure under host load; no Latch code was changed for this task.
+
+Independent GPT-6.1-Sol high review found shutdown, process-generation, event-ordering, and manual-resume persistence issues. The fixes have regression coverage, and the final focused review reports no remaining findings in its scope. A separate prose review checked the user guide.
+
+Native automation still requires installing and trusting the new Codex hook. SessionEnd plus release is a graceful-shutdown signal, not proof of exit status zero. Provider hook trust is not bypassed. A fresh real Codex UI quit/resume round trip remains unverified until normal hook trust is granted. Older already-closed records are not retroactively inferred as settled. The active user server is not stopped or restarted by this work.

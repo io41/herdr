@@ -257,6 +257,14 @@ mod tests {
 
         for (method, digest) in [
             (
+                "agent.conversation.snooze",
+                "4768fe345a298ef4a59d78287af10dbb49cd97e29a5fc12efe5a7049eaa6b6ef",
+            ),
+            (
+                "agent.conversation.wake",
+                "71fb47f9c97ffc880c94ca972959ae5458021eb61452fb057251ff3cf3667e08",
+            ),
+            (
                 "agent.conversation.settle_and_close",
                 "1c813656c38ff6e624f6a708a545846017d81d15fceb9bb04e1aad990ff079a0",
             ),

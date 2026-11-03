@@ -299,6 +299,13 @@ impl HeadlessServer {
     ///
     /// Returns true if the event changed visual state (requiring a re-render).
     pub(super) fn handle_internal_event_with_forwarding(&mut self, mut ev: AppEvent) -> bool {
+        if self.shutting_down
+            || self.should_quit.load(Ordering::Acquire)
+            || self.app.state.should_quit
+        {
+            self.app.pending_codex_session_ends.clear();
+            self.app.pending_codex_manual_resumes.clear();
+        }
         if self.host_shutdown_requested() {
             return false;
         }
@@ -658,12 +665,14 @@ impl HeadlessServer {
                             .map(|pane| pane.attached_terminal_id.to_string())
                     })
                 });
+                let mut confirmed_codex_exit = None;
                 if matches!(&ev, AppEvent::PaneDied { .. })
                     && !self
                         .app
                         .pending_worktree_remove_runtime_exits
                         .contains_key(&pane_id_val)
                 {
+                    confirmed_codex_exit = self.app.observe_codex_lifecycle_before_event(&ev);
                     if let Some(update) = self
                         .app
                         .state
@@ -672,10 +681,13 @@ impl HeadlessServer {
                         self.app.emit_pane_state_update(&update);
                         self.forward_semantic_agent_notification(&update);
                         self.forward_pane_state_update_notifications_to_clients(&update);
+                    } else {
+                        confirmed_codex_exit = None;
                     }
                 }
 
                 let pane_updates = self.app.handle_internal_event_with_pane_updates(ev);
+                self.app.finish_confirmed_codex_exit(confirmed_codex_exit);
                 for update in &pane_updates {
                     self.forward_semantic_agent_notification(update);
                     self.forward_pane_state_update_notifications_to_clients(update);
