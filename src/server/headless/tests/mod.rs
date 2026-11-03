@@ -6181,6 +6181,7 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
 
     assert!(
         server.handle_internal_event_with_forwarding(AppEvent::HookStateReported {
+            observed_at: std::time::Instant::now(),
             pane_id,
             source: "custom:pi".into(),
             agent_label: "pi".into(),

@@ -36,9 +36,17 @@ fn inbox(records: Vec<ConversationRecord>) -> ClientShellState {
     state.set_endpoint_methods_for(
         &ClientEndpointId::Local,
         Some(
-            ["list", "settle", "reopen", "resume", "open"]
-                .map(|action| format!("agent.conversation.{action}"))
-                .to_vec(),
+            [
+                "list",
+                "settle",
+                "settle_and_close",
+                "restore",
+                "reopen",
+                "resume",
+                "open",
+            ]
+            .map(|action| format!("agent.conversation.{action}"))
+            .to_vec(),
         ),
     );
     state.endpoints[0]
@@ -251,6 +259,12 @@ fn inbox_keyboard_menu_switches_mode_and_expands_working() {
         menu.highlighted = index;
     }
     press(&mut state, KeyCode::Enter);
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::ContextMenu(_))
+    ));
+    press(&mut state, KeyCode::Down);
+    press(&mut state, KeyCode::Enter);
     assert!(!state.agent_inbox);
     let index = actions
         .iter()
@@ -345,7 +359,14 @@ fn inbox_stale_generations_and_boots_cannot_replace_cache_or_enable_actions() {
     let Some(ClientShellOverlay::ContextMenu(menu)) = state.overlay.as_ref() else {
         panic!()
     };
-    assert!(menu.items().is_empty());
+    assert!(menu
+        .items()
+        .iter()
+        .all(|item| item.action == ClientContextMenuAction::Disabled));
+    assert!(menu
+        .items()
+        .iter()
+        .any(|item| item.label.contains("endpoint unavailable")));
     assert!(outcome.actions.is_empty());
 }
 
@@ -463,7 +484,7 @@ fn inbox_rejects_invalid_page_atomically_and_keeps_recovery_visible() {
 }
 
 #[test]
-fn inbox_settle_reopen_and_resume_are_explicit_distinct_endpoint_actions() {
+fn inbox_settle_and_restore_are_explicit_distinct_endpoint_actions() {
     let done = record("closed", ConversationSection::Inbox, false);
     let mut state = inbox(vec![done.clone()]);
     let mut outcome = ClientShellInput::default();
@@ -475,7 +496,7 @@ fn inbox_settle_reopen_and_resume_are_explicit_distinct_endpoint_actions() {
     );
     assert_eq!(outcome.actions.len(), 1);
     assert!(
-        matches!(&outcome.actions[0],ClientShellAction::Endpoint{request,..} if matches!(request.method,crate::api::schema::Method::AgentConversationSettle(_)))
+        matches!(&outcome.actions[0],ClientShellAction::Endpoint{request,..} if matches!(request.method,crate::api::schema::Method::AgentConversationSettleAndClose(_)))
     );
     assert!(outcome.requests.is_empty());
     assert_eq!(
@@ -488,18 +509,6 @@ fn inbox_settle_reopen_and_resume_are_explicit_distinct_endpoint_actions() {
             .disposition,
         Disposition::Inbox
     );
-    let mut settled = done.clone();
-    settled.disposition = Disposition::Settled;
-    outcome.actions.clear();
-    state.activate_conversation_action(
-        ClientEndpointId::Local,
-        settled,
-        ClientContextMenuAction::ConversationReopen,
-        &mut outcome,
-    );
-    assert!(
-        matches!(&outcome.actions[0],ClientShellAction::Endpoint{request,..} if matches!(request.method,crate::api::schema::Method::AgentConversationReopen(_)))
-    );
     outcome.actions.clear();
     state.activate_conversation_action(
         ClientEndpointId::Local,
@@ -508,7 +517,7 @@ fn inbox_settle_reopen_and_resume_are_explicit_distinct_endpoint_actions() {
         &mut outcome,
     );
     assert!(
-        matches!(&outcome.actions[0],ClientShellAction::Endpoint{request,..} if matches!(&request.method,crate::api::schema::Method::AgentConversationResume(params) if params.location.is_none()))
+        matches!(&outcome.actions[0],ClientShellAction::Endpoint{request,..} if matches!(&request.method,crate::api::schema::Method::AgentConversationRestore(params) if params.location.is_none()))
     );
 }
 
@@ -584,7 +593,7 @@ fn inbox_keyboard_opens_single_live_conversation_actions_and_settles_explicitly(
     let outcome = press(&mut state, KeyCode::Enter);
     assert_eq!(outcome.actions.len(), 1);
     assert!(
-        matches!(&outcome.actions[0],ClientShellAction::Endpoint{request,..} if matches!(request.method,crate::api::schema::Method::AgentConversationSettle(_)))
+        matches!(&outcome.actions[0],ClientShellAction::Endpoint{request,..} if matches!(request.method,crate::api::schema::Method::AgentConversationSettleAndClose(_)))
     );
 }
 
@@ -737,8 +746,7 @@ fn inbox_pending_resume_keeps_native_row_and_suppresses_only_exact_provisional_g
     let rows = state.visible_conversations();
     assert!(rows
         .iter()
-        .any(|row| row.id == "original-native"
-            && row.detail.contains("Awaiting session confirmation")));
+        .any(|row| row.id == "original-native" && row.status.contains("Confirm session")));
     assert!(rows.iter().any(|row| row.id == "conflicting-native"));
     assert!(rows.iter().any(|row| row.id == "conflicting-provisional"));
     assert!(!rows.iter().any(|row| row.id == "provisional-target"));
@@ -770,7 +778,7 @@ fn inbox_pending_resume_keeps_native_row_and_suppresses_only_exact_provisional_g
     assert!(
         super::super::agent_inbox::conversation_details(&menu.target)
             .iter()
-            .any(|line| line.contains("Awaiting session confirmation"))
+            .any(|line| line.contains("Confirm session"))
     );
 
     provisional.attachments[0].terminal_id = "replacement-terminal".into();
@@ -912,4 +920,130 @@ fn inbox_definitive_resume_failure_reports_without_reopening_or_replaying_on_res
     assert!(state.visible_conversations().is_empty());
     let restored = inbox(vec![failed]);
     assert!(restored.visible_endpoint_notice.is_none());
+}
+
+#[test]
+fn inbox_generic_titles_use_location_and_keep_status_complete_in_narrow_rows() {
+    let mut first = record("first", ConversationSection::Inbox, true);
+    first.title = "Agent conversation".into();
+    first.blocking_request = true;
+    first.attachments[0].pane_number = Some(1);
+    let mut second = first.clone();
+    second.id = "second".into();
+    second.attachments[0].pane_number = Some(2);
+    let state = inbox(vec![first, second]);
+    let rows = state.visible_conversations();
+    assert_eq!(rows[0].label, "Task");
+    assert!(rows[0].detail.contains("Project / Task / Pane 1"));
+    assert!(rows[1].detail.contains("Project / Task / Pane 2"));
+    assert!(!rows[0].detail.contains("Local"));
+    let headline = super::super::agent_inbox::row_headline(&rows[0], 24, true);
+    assert!(headline.contains("Needs input"));
+    assert!(render::display_width(&headline) <= 24);
+    let detail = super::super::agent_inbox::row_detail(&rows[0], 24);
+    assert!(detail.contains("codex"));
+    assert!(detail.contains("#1"));
+    assert!(render::display_width(&detail) <= 24);
+}
+
+#[test]
+fn inbox_closed_names_are_last_known_and_searchable_by_location() {
+    let mut closed = record("closed", ConversationSection::Settled, false);
+    closed.title = "Agent conversation".into();
+    closed.saved_location.pane_label = Some("Review tests".into());
+    let state = inbox(vec![closed]);
+    let rows = super::super::agent_inbox::conversation_rows(&state.endpoints);
+    assert_eq!(rows[0].label, "Review tests");
+    assert!(rows[0]
+        .detail
+        .contains("Last known: Project / Task / Review tests"));
+    let navigator = ClientNavigatorOverlay {
+        query: TextEditor::new("Project", false),
+        search_focused: true,
+        selected: None,
+        scroll: 0,
+        filter: None,
+    };
+    let rows =
+        render::client_navigator_rows(&state.endpoints, &state.active_endpoint_id, &navigator);
+    assert!(rows
+        .iter()
+        .any(|row| row.label == "Review tests" && row.detail.contains("Last known:")));
+}
+
+#[test]
+fn inbox_menus_use_one_restore_and_disable_unsafe_or_unsupported_settle() {
+    use super::super::agent_inbox::conversation_menu_items;
+    let state = inbox(vec![]);
+    let methods = state.endpoints[0].methods.as_ref().unwrap();
+    let closed = record("closed", ConversationSection::Settled, false);
+    let items = conversation_menu_items(&closed, true, methods);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].action, ClientContextMenuAction::ConversationResume);
+    assert_eq!(items[0].label, "Restore  r");
+    let mut blocked = record("blocked", ConversationSection::Inbox, true);
+    blocked.blocking_request = true;
+    let items = conversation_menu_items(&blocked, true, methods);
+    assert!(items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::Disabled
+            && item.label.contains("needs input")));
+    assert!(!items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::ConversationSettle));
+    blocked.blocking_request = false;
+    let old_methods = HashSet::from(["agent.conversation.settle".to_string()]);
+    let items = conversation_menu_items(&blocked, true, &old_methods);
+    assert!(items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::Disabled
+            && item.label.contains("update endpoint")));
+    assert!(!items
+        .iter()
+        .any(|item| item.action == ClientContextMenuAction::ConversationSettle));
+}
+
+#[test]
+fn inbox_view_header_replaces_old_text_and_clears_old_hit_region() {
+    let mut state = inbox(vec![]);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 42, 10));
+    buffer.set_string(0, 1, " agents                 grouped", Style::default());
+    state.hits.agent_body = Rect::new(0, 3, 42, 7);
+    state.hits.agent_sort_toggle = Rect::new(24, 1, 7, 1);
+    super::super::agent_inbox::render_conversation_panel(
+        &mut buffer,
+        &state.endpoints,
+        true,
+        state.agent_inbox_expanded,
+        None,
+        &state.conversation_read,
+        false,
+        &state.config,
+        &mut state.agent_scroll,
+        &mut state.hits,
+    );
+    let title: String = (0..42).map(|x| buffer[(x, 1)].symbol()).collect();
+    assert!(title.contains("Inbox ▾"));
+    assert!(!title.contains("grouped"));
+    assert!(!title.contains("flat"));
+    assert!(state.hits.agent_sort_toggle.is_empty());
+    assert_eq!(state.hits.agent_inbox_toggle, Rect::new(0, 1, 42, 1));
+}
+
+#[test]
+fn inbox_narrow_closed_row_keeps_every_last_known_location_component() {
+    let mut closed = record("closed", ConversationSection::Settled, false);
+    closed.saved_location.workspace_label = "cwd".into();
+    closed.saved_location.tab_label = "1".into();
+    closed.saved_location.pane_number = Some(1);
+    closed.saved_location.pane_id = 1;
+    let state = inbox(vec![closed]);
+    let rows = super::super::agent_inbox::conversation_rows(&state.endpoints);
+    let detail = super::super::agent_inbox::row_detail(&rows[0], 25);
+    assert_eq!(detail, "codex · Last: cwd/1/#1");
+    assert!(render::display_width(&detail) <= 25);
+    assert_eq!(
+        super::super::agent_inbox::row_detail(&rows[0], 80),
+        "codex · Last known: cwd / 1 / Pane 1"
+    );
 }

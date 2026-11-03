@@ -28,6 +28,153 @@ pub struct SessionSnapshot {
     pub collapsed_space_keys: std::collections::HashSet<String>,
 }
 
+impl SessionSnapshot {
+    /// Remove only terminal generations durably retired by an intentional close.
+    pub(crate) fn prune_retired_terminals(
+        &mut self,
+        retired: &std::collections::BTreeSet<String>,
+        history: Option<&mut SessionHistorySnapshot>,
+    ) {
+        if retired.is_empty() {
+            return;
+        }
+        let mut history = match history {
+            Some(history)
+                if history.layout_fingerprint.is_some()
+                    && history.layout_fingerprint == layout_fingerprint(self) =>
+            {
+                Some(history)
+            }
+            Some(history) => {
+                // Invalid history must stay rejected even if it matches the pruned layout.
+                history.layout_fingerprint = None;
+                None
+            }
+            None => None,
+        };
+        let mut history_workspaces = history
+            .as_deref_mut()
+            .map(|history| std::mem::take(&mut history.workspaces))
+            .unwrap_or_default()
+            .into_iter();
+        let mut kept_workspaces = Vec::new();
+        for (workspace_index, mut workspace) in
+            std::mem::take(&mut self.workspaces).into_iter().enumerate()
+        {
+            let mut workspace_history = history_workspaces
+                .next()
+                .unwrap_or_else(|| WorkspaceHistorySnapshot { tabs: Vec::new() });
+            let mut history_tabs = std::mem::take(&mut workspace_history.tabs).into_iter();
+            let mut kept_tabs = Vec::new();
+            for (tab_index, mut tab) in std::mem::take(&mut workspace.tabs).into_iter().enumerate()
+            {
+                let mut tab_history = history_tabs.next().unwrap_or_else(|| TabHistorySnapshot {
+                    panes: HashMap::new(),
+                });
+                let removed: std::collections::HashSet<_> = tab
+                    .panes
+                    .iter()
+                    .filter(|(_, pane)| {
+                        pane.terminal_id
+                            .as_ref()
+                            .is_some_and(|id| retired.contains(id))
+                    })
+                    .map(|(&id, _)| id)
+                    .collect();
+                if !removed.is_empty() {
+                    workspace
+                        .public_pane_numbers
+                        .retain(|id, _| !removed.contains(id));
+                    let layout = std::mem::replace(&mut tab.layout, LayoutSnapshot::Pane(0));
+                    let Some(layout) = prune_layout(layout, &removed) else {
+                        continue;
+                    };
+                    tab.layout = layout;
+                    tab.panes.retain(|id, _| !removed.contains(id));
+                    tab_history.panes.retain(|id, _| !removed.contains(id));
+                    let fallback = first_pane_id_in_layout(&tab.layout);
+                    if tab.focused.is_some_and(|id| removed.contains(&id)) {
+                        tab.focused = fallback;
+                        tab.zoomed = false;
+                    }
+                    if tab.root_pane.is_some_and(|id| removed.contains(&id)) {
+                        tab.root_pane = fallback;
+                    }
+                }
+                kept_tabs.push(tab_index);
+                workspace.tabs.push(tab);
+                if history.is_some() {
+                    workspace_history.tabs.push(tab_history);
+                }
+            }
+            if workspace.tabs.is_empty() {
+                continue;
+            }
+            workspace.active_tab = remapped_index(workspace.active_tab, &kept_tabs);
+            workspace.tab_location_ids = kept_tabs
+                .iter()
+                .filter_map(|&i| workspace.tab_location_ids.get(i).cloned())
+                .collect();
+            workspace.public_tab_numbers = kept_tabs
+                .iter()
+                .filter_map(|&i| workspace.public_tab_numbers.get(i).copied())
+                .collect();
+            kept_workspaces.push(workspace_index);
+            self.workspaces.push(workspace);
+            if let Some(history) = history.as_deref_mut() {
+                history.workspaces.push(workspace_history);
+            }
+        }
+        self.active = self.active.and_then(|index| {
+            (!kept_workspaces.is_empty()).then(|| remapped_index(index, &kept_workspaces))
+        });
+        self.selected = remapped_index(self.selected, &kept_workspaces);
+        if let Some(history) = history {
+            history.layout_fingerprint = layout_fingerprint(self);
+        }
+    }
+}
+
+fn remapped_index(index: usize, kept: &[usize]) -> usize {
+    kept.iter()
+        .position(|&old| old == index)
+        .unwrap_or_else(|| {
+            kept.iter()
+                .filter(|&&old| old < index)
+                .count()
+                .min(kept.len().saturating_sub(1))
+        })
+}
+
+fn prune_layout(
+    layout: LayoutSnapshot,
+    removed: &std::collections::HashSet<u32>,
+) -> Option<LayoutSnapshot> {
+    match layout {
+        LayoutSnapshot::Pane(id) => (!removed.contains(&id)).then_some(LayoutSnapshot::Pane(id)),
+        LayoutSnapshot::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            match (
+                prune_layout(*first, removed),
+                prune_layout(*second, removed),
+            ) {
+                (Some(first), Some(second)) => Some(LayoutSnapshot::Split {
+                    direction,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (Some(layout), None) | (None, Some(layout)) => Some(layout),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct SessionHistorySnapshot {
     /// Format version follows the matching session snapshot version.
@@ -102,6 +249,8 @@ pub struct TabSnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     pub cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -389,6 +538,7 @@ fn capture_tab(
         panes.insert(
             id.raw(),
             PaneSnapshot {
+                terminal_id: terminal_id.map(ToString::to_string),
                 cwd,
                 label,
                 agent_name,
@@ -533,6 +683,204 @@ mod tests {
     use crate::app::{AppState, Mode};
     use crate::layout::NavDirection;
     use crate::workspace::Workspace;
+
+    #[test]
+    fn retired_generation_pruning_preserves_replacements_legacy_panes_and_focus() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let retired_pane = state.workspaces[0].test_split(Direction::Horizontal);
+        let replacement = state.workspaces[0].test_split(Direction::Vertical);
+        state.ensure_test_terminals();
+        state.workspaces[0].tabs[0].layout.focus_pane(root);
+        let mut snapshot = capture_from_state(&state);
+        let tab = &mut snapshot.workspaces[0].tabs[0];
+        let retired = tab.panes[&retired_pane.raw()].terminal_id.clone().unwrap();
+        assert_eq!(
+            retired,
+            state.workspaces[0].tabs[0]
+                .terminal_id(retired_pane)
+                .unwrap()
+                .to_string()
+        );
+        // Legacy snapshots lack generations, so their panes cannot match a tombstone.
+        tab.panes.get_mut(&root.raw()).unwrap().terminal_id = None;
+        tab.panes.get_mut(&replacement.raw()).unwrap().terminal_id = Some("replacement".into());
+        tab.zoomed = true;
+        snapshot.prune_retired_terminals(&[retired].into(), None);
+        let tab = &snapshot.workspaces[0].tabs[0];
+        assert_eq!(tab.panes.len(), 2);
+        assert!(tab.panes.contains_key(&root.raw()));
+        assert!(tab.panes.contains_key(&replacement.raw()));
+        assert_eq!(tab.focused, Some(root.raw()));
+        assert_eq!(tab.root_pane, Some(root.raw()));
+        assert!(tab.zoomed);
+        let mut ids = Vec::new();
+        fn collect(layout: &LayoutSnapshot, ids: &mut Vec<u32>) {
+            match layout {
+                LayoutSnapshot::Pane(id) => ids.push(*id),
+                LayoutSnapshot::Split { first, second, .. } => {
+                    collect(first, ids);
+                    collect(second, ids);
+                }
+            }
+        }
+        collect(&tab.layout, &mut ids);
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains(&retired_pane.raw()));
+    }
+
+    #[test]
+    fn retired_generation_pruning_collapses_tabs_workspaces_and_last_pane() {
+        let mut state = state_with_workspaces(&["closed", "survivor"]);
+        state.workspaces[1].test_add_tab(Some("kept"));
+        state.workspaces[1].switch_tab(1);
+        state.ensure_test_terminals();
+        state.active = Some(1);
+        state.selected = 1;
+        let mut snapshot = capture_from_state(&state);
+        let kept_location = snapshot.workspaces[1].tab_location_ids[1].clone();
+        let kept_tab_number = snapshot.workspaces[1].public_tab_numbers[1];
+        let kept_root = snapshot.workspaces[1].tabs[1].root_pane;
+        let retired = [0, 1].map(|index| {
+            snapshot.workspaces[index].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .terminal_id
+                .clone()
+                .unwrap()
+        });
+        snapshot.prune_retired_terminals(&retired.into(), None);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.active, Some(0));
+        assert_eq!(snapshot.selected, 0);
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(workspace.tabs.len(), 1);
+        assert_eq!(workspace.active_tab, 0);
+        assert_eq!(workspace.tab_location_ids, vec![kept_location]);
+        assert_eq!(workspace.public_tab_numbers, vec![kept_tab_number]);
+        assert_eq!(workspace.tabs[0].root_pane, kept_root);
+        assert_eq!(workspace.tabs[0].focused, kept_root);
+        let last_generation = workspace.tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .terminal_id
+            .clone()
+            .unwrap();
+        snapshot.prune_retired_terminals(&[last_generation].into(), None);
+        assert!(snapshot.workspaces.is_empty());
+        assert_eq!(snapshot.active, None);
+        assert_eq!(snapshot.selected, 0);
+    }
+
+    fn snapshot_history_and_retired_generations() -> (
+        SessionSnapshot,
+        SessionHistorySnapshot,
+        std::collections::BTreeSet<String>,
+        u32,
+    ) {
+        let mut state = state_with_workspaces(&["closed", "survivor"]);
+        state.workspaces[1].test_add_tab(Some("kept"));
+        state.workspaces[1].switch_tab(1);
+        let surviving_pane = state.workspaces[1].tabs[1].root_pane.raw();
+        let closed_split = state.workspaces[1].test_split(Direction::Horizontal).raw();
+        state.ensure_test_terminals();
+        let snapshot = capture_from_state(&state);
+        let retired = [
+            (0, 0, state.workspaces[0].tabs[0].root_pane.raw()),
+            (1, 0, state.workspaces[1].tabs[0].root_pane.raw()),
+            (1, 1, closed_split),
+        ]
+        .into_iter()
+        .map(|(workspace, tab, pane)| {
+            snapshot.workspaces[workspace].tabs[tab].panes[&pane]
+                .terminal_id
+                .clone()
+                .unwrap()
+        })
+        .collect();
+        let history = SessionHistorySnapshot {
+            version: SNAPSHOT_VERSION,
+            layout_fingerprint: layout_fingerprint(&snapshot),
+            workspaces: snapshot
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(workspace_index, workspace)| WorkspaceHistorySnapshot {
+                    tabs: workspace
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(tab_index, tab)| TabHistorySnapshot {
+                            panes: tab
+                                .panes
+                                .keys()
+                                .map(|&id| {
+                                    (
+                                        id,
+                                        PaneHistorySnapshot {
+                                            ansi: format!(
+                                                "history-{workspace_index}-{tab_index}-{id}"
+                                            ),
+                                            lines: 1,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        (snapshot, history, retired, surviving_pane)
+    }
+
+    #[test]
+    fn retired_generation_pruning_preserves_matching_history_at_retained_indices() {
+        let (mut snapshot, mut history, retired, surviving_pane) =
+            snapshot_history_and_retired_generations();
+        let expected_ansi = history.workspaces[1].tabs[1].panes[&surviving_pane]
+            .ansi
+            .clone();
+        snapshot.prune_retired_terminals(&retired, Some(&mut history));
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].tabs.len(), 1);
+        assert_eq!(snapshot.workspaces[0].tabs[0].panes.len(), 1);
+        assert_eq!(history.workspaces.len(), 1);
+        assert_eq!(history.workspaces[0].tabs.len(), 1);
+        assert_eq!(history.workspaces[0].tabs[0].panes.len(), 1);
+        let pane_history = &history.workspaces[0].tabs[0].panes[&surviving_pane];
+        assert_eq!(pane_history.ansi, expected_ansi);
+        assert_eq!(pane_history.lines, 1);
+        assert!(history.layout_fingerprint.is_some());
+        assert_eq!(history.layout_fingerprint, layout_fingerprint(&snapshot));
+    }
+
+    #[test]
+    fn retired_generation_pruning_does_not_accept_or_remap_invalid_history() {
+        for missing_fingerprint in [false, true] {
+            let (mut snapshot, mut history, retired, _) =
+                snapshot_history_and_retired_generations();
+            let mut pruned = parse_snapshot(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+            pruned.prune_retired_terminals(&retired, None);
+            history.layout_fingerprint = if missing_fingerprint {
+                None
+            } else {
+                layout_fingerprint(&pruned)
+            };
+            assert_ne!(history.layout_fingerprint, layout_fingerprint(&snapshot));
+            snapshot.prune_retired_terminals(&retired, Some(&mut history));
+            assert_eq!(history.layout_fingerprint, None);
+            assert_eq!(history.workspaces.len(), 2);
+            assert_eq!(history.workspaces[1].tabs.len(), 2);
+            assert_eq!(history.workspaces[1].tabs[1].panes.len(), 2);
+            assert_eq!(snapshot.workspaces.len(), 1);
+            assert_eq!(snapshot.workspaces[0].tabs.len(), 1);
+        }
+    }
 
     fn session_fixture(name: &str) -> &'static str {
         match name {
@@ -708,6 +1056,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                terminal_id: None,
                 cwd: PathBuf::from("/home/can/Projects/herdr"),
                 label: None,
                 agent_name: None,
@@ -720,6 +1069,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                terminal_id: None,
                 cwd: PathBuf::from("/home/can/Projects/website"),
                 label: Some("website".into()),
                 agent_name: None,
@@ -1438,6 +1788,7 @@ mod tests {
         panes.insert(
             0,
             PaneSnapshot {
+                terminal_id: None,
                 cwd: PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test"),
                 label: None,
                 agent_name: None,
@@ -1450,6 +1801,7 @@ mod tests {
         panes.insert(
             1,
             PaneSnapshot {
+                terminal_id: None,
                 cwd: std::env::var("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_else(|_| PathBuf::from("/tmp")),

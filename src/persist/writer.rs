@@ -40,14 +40,19 @@ impl SessionWriter {
         snapshot: &SessionSnapshot,
         history: Option<&SessionHistorySnapshot>,
     ) {
-        let result = self.preserve_unloaded().and_then(|()| {
-            self.preserve_snapshot_history();
-            super::io::save_to_path(&self.path, snapshot)
-        });
-        if let Err(err) = result {
+        if let Err(err) = self.save_checked(snapshot, history) {
             crate::logging::session_save_failed(&self.path, &err.to_string());
-            return;
         }
+    }
+
+    pub(crate) fn save_checked(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        history: Option<&SessionHistorySnapshot>,
+    ) -> io::Result<()> {
+        self.preserve_unloaded()?;
+        self.preserve_snapshot_history();
+        super::io::save_to_path(&self.path, snapshot)?;
         // Optional history failure must not reclassify our committed layout as unloaded.
         self.protect_unloaded = false;
         self.preserve_snapshot_history();
@@ -56,6 +61,7 @@ impl SessionWriter {
             crate::logging::session_save_failed(&history_path, &err.to_string());
         }
         crate::logging::session_saved(&self.path, snapshot.workspaces.len());
+        Ok(())
     }
 
     pub(crate) fn clear(&mut self) {
@@ -271,6 +277,23 @@ fn recovery_timestamp(name: &str) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_save_reports_checkpoint_failure_without_overwriting_previous_session() {
+        let mut writer = writer(true);
+        let previous = b"unloaded session bytes";
+        std::fs::write(&writer.path, previous).unwrap();
+        std::fs::write(writer.path.with_file_name("session-backups"), b"blocked").unwrap();
+        assert!(writer.save_checked(&snapshot(), None).is_err());
+        assert_eq!(std::fs::read(&writer.path).unwrap(), previous);
+        assert!(writer.protect_unloaded);
+        std::fs::remove_file(writer.path.with_file_name("session-backups")).unwrap();
+        std::fs::remove_file(&writer.path).unwrap();
+        std::fs::create_dir(&writer.path).unwrap();
+        writer.protect_unloaded = false;
+        assert!(writer.save_checked(&snapshot(), None).is_err());
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
 
     fn writer(protect_unloaded: bool) -> SessionWriter {
         let directory = std::env::temp_dir().join(format!(

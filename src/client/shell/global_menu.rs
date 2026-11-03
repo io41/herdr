@@ -54,11 +54,11 @@ pub(super) fn global_menu_items(
         ClientGlobalMenuAction::Binding(crate::input::KeybindAction::Detach),
     ));
     items.push((
-        "conversation actions...",
+        "conversation actions…  prefix+shift+a",
         ClientGlobalMenuAction::ConversationActions,
     ));
     items.push((
-        "agent inbox / flat",
+        "agent view…  prefix+i",
         ClientGlobalMenuAction::ToggleAgentInbox,
     ));
     for (index, label) in [
@@ -131,18 +131,10 @@ impl ClientShellState {
                 self.persist_chrome_preferences(outcome);
             }
             ClientGlobalMenuAction::ConversationActions => {
-                if let Some((endpoint_id, id)) = self.agent_inbox_selected.clone() {
-                    self.open_conversation(endpoint_id, id, true, outcome);
-                } else {
-                    self.set_endpoint_error("Select a conversation before opening its actions");
-                }
+                self.open_selected_conversation_actions(outcome)
             }
             ClientGlobalMenuAction::WhatsNew => self.open_release_notes(),
-            ClientGlobalMenuAction::ToggleAgentInbox => {
-                self.agent_inbox = !self.agent_inbox;
-                self.agent_scroll = 0;
-                self.persist_chrome_preferences(outcome);
-            }
+            ClientGlobalMenuAction::ToggleAgentInbox => self.open_agent_view_selector(outcome),
         }
         outcome.repaint = true;
     }

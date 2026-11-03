@@ -68,6 +68,7 @@ fn real_exit(app: &mut AppState, pane_id: PaneId, agent: Agent, at: Instant) {
 
 fn pi_report(app: &mut AppState, pane_id: PaneId, state: AgentState, seq: u64) {
     app.handle_app_event(AppEvent::HookStateReported {
+        observed_at: std::time::Instant::now(),
         pane_id,
         source: "herdr:pi".into(),
         agent_label: "pi".into(),

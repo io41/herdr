@@ -2,7 +2,7 @@
 
 Status: implemented in the `io41/herdr` custom fork, with the new view disabled by default. See [verification results](evidence.md#implementation-verification) for completed checks and remaining environment limits.
 
-Replace the flat Agents list with an inbox that brings completed work and human requests into view. Keep running work collapsed and let the user explicitly settle reviewed conversations. Preserve Spaces, tabs, panes, terminal processes, and workspace membership.
+Replace the flat Agents list with an inbox that brings completed work and human requests into view. Keep running work collapsed and let the user explicitly settle reviewed conversations. Preserve unrelated Spaces, tabs, panes, and processes. Explicit Settle saves and closes its conversation pane; Restore reuses or creates only the required location.
 
 Read these documents in order:
 

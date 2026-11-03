@@ -82,6 +82,8 @@ operations::define_operations! {
     AgentConversationOpen(AgentConversationOpenParams) => "agent.conversation.open", true, true;
     AgentConversationList(AgentConversationListParams) => "agent.conversation.list", false, true;
     AgentConversationSettle(AgentConversationMutationParams) => "agent.conversation.settle", true, true;
+    AgentConversationSettleAndClose(AgentConversationMutationParams) => "agent.conversation.settle_and_close", true, true;
+    AgentConversationRestore(AgentConversationRestoreParams) => "agent.conversation.restore", true, true;
     AgentConversationReopen(AgentConversationMutationParams) => "agent.conversation.reopen", true, true;
     AgentConversationResume(AgentConversationResumeParams) => "agent.conversation.resume", true, true;
     AgentGet(AgentTarget) => "agent.get", false, false;

@@ -614,6 +614,30 @@ impl ClientShellState {
         }
 
         if matches!(self.overlay, Some(ClientShellOverlay::ContextMenu(_))) {
+            if key.modifiers.is_empty() {
+                let action = match key.code {
+                    KeyCode::Char('s') => Some(ClientContextMenuAction::ConversationSettle),
+                    KeyCode::Char('r') => Some(ClientContextMenuAction::ConversationResume),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    let index = match self.overlay.as_ref() {
+                        Some(ClientShellOverlay::ContextMenu(menu))
+                            if matches!(
+                                menu.target,
+                                ClientContextMenuTarget::Conversation { .. }
+                            ) =>
+                        {
+                            menu.items().iter().position(|item| item.action == action)
+                        }
+                        _ => None,
+                    };
+                    if let Some(index) = index {
+                        self.activate_context_menu_item(index, outcome);
+                    }
+                    return;
+                }
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.overlay = None;

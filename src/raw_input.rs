@@ -15,14 +15,18 @@ pub fn parse_raw_input_bytes_sync(data: &[u8]) -> Vec<RawInputEvent> {
 
 /// Decode bytes the byte framer already split into complete input. This applies
 /// no timing policy of its own: the reader decided where each event ends.
-#[cfg(any(unix, test))]
 pub(crate) fn parse_framed_input(data: &[u8]) -> Vec<RawInputEvent> {
     let mut events = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
         let Some((event, consumed)) = extract_one_event(rest) else {
             // A lone ESC or Alt introducer the reader released as a key.
-            events.extend(events_from_framed_chunks(vec![rest.to_vec()]));
+            let fallback = events_from_framed_chunks(vec![rest.to_vec()]);
+            if fallback.is_empty() {
+                events.push(RawInputEvent::Unsupported);
+            } else {
+                events.extend(fallback);
+            }
             break;
         };
         events.push(event);

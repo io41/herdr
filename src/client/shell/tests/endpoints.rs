@@ -1478,15 +1478,21 @@ fn aggregate_agents_use_configured_rows_machine_token_and_status_colors() {
         .join("\n");
     assert!(text.contains("○ Local · local agent"), "frame: {text}");
     assert!(text.contains("× Build · remote agent"), "frame: {text}");
-    assert!(text.contains("grouped"), "frame: {text}");
-    let toggle = state.hits.agent_sort_toggle;
+    assert!(text.contains("All agents by space"), "frame: {text}");
+    let toggle = state.hits.agent_inbox_toggle;
     assert!(!toggle.is_empty());
+    assert!(state.hits.agent_sort_toggle.is_empty());
     let click = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: toggle.x,
         row: toggle.y,
         modifiers: KeyModifiers::empty(),
     })]);
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::ContextMenu(_))
+    ));
+    state.handle_input_bytes(b"\x1b[B\r");
     assert_eq!(
         state.config.agent_panel_sort,
         crate::config::AgentPanelSortConfig::Priority
@@ -1689,7 +1695,7 @@ fn selected_default_view_ignores_inactive_endpoint_projection() {
         .join("\n");
     assert!(text.contains("Local · local agent"), "frame: {text}");
     assert!(text.contains("Build · remote agent"), "frame: {text}");
-    assert!(text.contains("grouped"), "frame: {text}");
+    assert!(text.contains("All agents by space"), "frame: {text}");
 }
 
 #[test]

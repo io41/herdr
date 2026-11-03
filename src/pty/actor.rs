@@ -1,3 +1,18 @@
+#[derive(Clone, Default)]
+pub(crate) struct InputSubmissionReceipt(
+    std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+);
+
+impl InputSubmissionReceipt {
+    pub(crate) fn mark_delivered(&self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(std::time::Instant::now());
+    }
+
+    pub(crate) fn delivered_at(&self) -> Option<std::time::Instant> {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner())
+    }
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -10,6 +25,7 @@ mod windows {
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::InputSubmissionReceipt;
     use bytes::Bytes;
     use portable_pty::{MasterPty, PtySize};
     use tokio::sync::{mpsc, oneshot};
@@ -46,6 +62,7 @@ mod windows {
     enum PtyIoDataCommand {
         WriteUserInput(Bytes),
         SubmitUserInput {
+            receipt: Option<InputSubmissionReceipt>,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
@@ -56,7 +73,12 @@ mod windows {
 
     enum PtyIoWriteCommand {
         Write(Bytes),
+        UserInput {
+            bytes: Bytes,
+            accepting: Arc<Mutex<InputAcceptance>>,
+        },
         SubmissionPart {
+            receipt: Option<InputSubmissionReceipt>,
             bytes: Bytes,
             deadline: Option<Instant>,
             reply: oneshot::Sender<std::io::Result<()>>,
@@ -67,6 +89,8 @@ mod windows {
     struct InputAcceptance {
         accepting: bool,
         enter_completion: Option<std_mpsc::Receiver<()>>,
+        pending_input: usize,
+        last_input_delivery: Option<Instant>,
     }
 
     enum PtyIoControlCommand {
@@ -88,14 +112,14 @@ mod windows {
             &self,
             bytes: Bytes,
         ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-            if !self
+            let mut accepting = self
                 .accepting
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .accepting
-            {
+                .unwrap_or_else(|error| error.into_inner());
+            if !accepting.accepting {
                 return Err(mpsc::error::TrySendError::Closed(bytes));
             }
+            let nonempty = !bytes.is_empty();
             self.data_tx
                 .try_send(PtyIoDataCommand::WriteUserInput(bytes))
                 .map_err(|err| match err {
@@ -111,15 +135,29 @@ mod windows {
                         };
                         mpsc::error::TrySendError::Closed(bytes)
                     }
-                })
+                })?;
+            accepting.pending_input += usize::from(nonempty);
+            Ok(())
         }
 
-        pub(crate) fn queue_user_input_submission(
+        pub(crate) fn user_input_delivered_before(&self, observed_at: Instant) -> bool {
+            let input = self
+                .accepting
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            input.pending_input == 0
+                && input
+                    .last_input_delivery
+                    .is_none_or(|delivered| delivered < observed_at)
+        }
+
+        pub(crate) fn queue_user_input_submission_with_receipt(
             &self,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
+            receipt: Option<InputSubmissionReceipt>,
         ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
             let accepting = self
                 .accepting
@@ -134,6 +172,7 @@ mod windows {
             let (reply_tx, reply_rx) = std_mpsc::channel();
             self.data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    receipt,
                     text,
                     enter,
                     delay,
@@ -224,6 +263,8 @@ mod windows {
             let accepting = Arc::new(Mutex::new(InputAcceptance {
                 accepting: !initially_quiesced,
                 enter_completion: None,
+                pending_input: 0,
+                last_input_delivery: None,
             }));
 
             crate::thread_spawn::spawn_named("herdr-pty-writer", move || {
@@ -314,7 +355,17 @@ mod windows {
         for command in write_rx {
             let result = match command {
                 PtyIoWriteCommand::Write(bytes) => write_and_flush(writer, &bytes),
+                PtyIoWriteCommand::UserInput { bytes, accepting } => {
+                    let result = write_and_flush(writer, &bytes);
+                    if result.is_ok() && !bytes.is_empty() {
+                        let mut input = accepting.lock().unwrap_or_else(|error| error.into_inner());
+                        input.pending_input = input.pending_input.saturating_sub(1);
+                        input.last_input_delivery = Some(Instant::now());
+                    }
+                    result
+                }
                 PtyIoWriteCommand::SubmissionPart {
+                    receipt,
                     bytes,
                     deadline,
                     reply,
@@ -328,6 +379,11 @@ mod windows {
                     let failed = result
                         .as_ref()
                         .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
+                    if result.is_ok() {
+                        if let Some(receipt) = receipt {
+                            receipt.mark_delivered();
+                        }
+                    }
                     // Wake synchronous shutdown directly; it may be blocking the executor
                     // worker that would otherwise receive the async acknowledgement.
                     drop(enter_completion);
@@ -352,11 +408,18 @@ mod windows {
         while let Some(command) = data_rx.recv().await {
             match command {
                 PtyIoDataCommand::WriteUserInput(bytes) => {
-                    if write_tx.send(PtyIoWriteCommand::Write(bytes)).is_err() {
+                    if write_tx
+                        .send(PtyIoWriteCommand::UserInput {
+                            bytes,
+                            accepting: accepting.clone(),
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 PtyIoDataCommand::SubmitUserInput {
+                    receipt,
                     text,
                     enter,
                     delay,
@@ -377,7 +440,14 @@ mod windows {
                             if !delay.is_zero() {
                                 tokio::time::sleep(delay).await;
                             }
-                            write_submission_part(&write_tx, enter, None, Some(&accepting)).await
+                            write_submission_part_with_receipt(
+                                &write_tx,
+                                enter,
+                                None,
+                                Some(&accepting),
+                                receipt,
+                            )
+                            .await
                         }
                         .await
                     };
@@ -399,6 +469,16 @@ mod windows {
         deadline: Option<Instant>,
         accepting: Option<&Arc<Mutex<InputAcceptance>>>,
     ) -> std::io::Result<()> {
+        write_submission_part_with_receipt(write_tx, bytes, deadline, accepting, None).await
+    }
+
+    async fn write_submission_part_with_receipt(
+        write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
+        bytes: Bytes,
+        deadline: Option<Instant>,
+        accepting: Option<&Arc<Mutex<InputAcceptance>>>,
+        receipt: Option<InputSubmissionReceipt>,
+    ) -> std::io::Result<()> {
         let completion = {
             let (reply, completion) = oneshot::channel();
             let mut accepting = accepting.map(|accepting| {
@@ -418,6 +498,7 @@ mod windows {
             };
             write_tx
                 .send(PtyIoWriteCommand::SubmissionPart {
+                    receipt,
                     bytes,
                     deadline,
                     reply,
@@ -453,6 +534,8 @@ mod windows {
             Arc::new(Mutex::new(InputAcceptance {
                 accepting,
                 enter_completion: None,
+                pending_input: 0,
+                last_input_delivery: None,
             }))
         }
 
@@ -528,6 +611,7 @@ mod windows {
             let accepting = input_acceptance(true);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    receipt: None,
                     text: Bytes::from_static(b"prompt"),
                     enter: Bytes::from_static(b"\r"),
                     delay,
@@ -619,6 +703,7 @@ mod windows {
             let accepting = input_acceptance(true);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    receipt: None,
                     text: Bytes::from_static(b"first"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(30),
@@ -628,6 +713,7 @@ mod windows {
                 .unwrap();
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    receipt: None,
                     text: Bytes::from_static(b"expired"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::ZERO,
@@ -671,6 +757,7 @@ mod windows {
             let deadline = Instant::now() + Duration::from_millis(50);
             data_tx
                 .try_send(PtyIoDataCommand::SubmitUserInput {
+                    receipt: None,
                     text: Bytes::from_static(b"committed"),
                     enter: Bytes::from_static(b"\r"),
                     delay: Duration::from_millis(20),
@@ -705,6 +792,7 @@ mod windows {
                 deadline,
                 reply,
                 enter_completion,
+                ..
             } = next_write_command(&write_rx).await
             else {
                 panic!("queued user input cannot overtake Enter");
@@ -718,10 +806,83 @@ mod windows {
             drop(enter_completion);
             reply.send(Ok(())).unwrap();
             forwarder.await.unwrap();
-            let PtyIoWriteCommand::Write(bytes) = write_rx.try_recv().unwrap() else {
+            let PtyIoWriteCommand::UserInput { bytes, .. } = write_rx.try_recv().unwrap() else {
                 panic!("ordinary user input follows Enter");
             };
             assert_eq!(bytes, b"after".as_slice());
+        }
+
+        #[test]
+        fn raw_input_delivery_barrier_releases_only_after_successful_flush() {
+            for fail_after in [None, Some(0)] {
+                let accepting = input_acceptance(true);
+                accepting.lock().unwrap().pending_input = 1;
+                let (flushed, _flushed_rx) = std_mpsc::channel();
+                let mut writer = RecordingWriter {
+                    writes: Vec::new(),
+                    flushes: Vec::new(),
+                    fail_after,
+                    flushed,
+                };
+                let (write_tx, write_rx) = std_mpsc::channel();
+                write_tx
+                    .send(PtyIoWriteCommand::UserInput {
+                        bytes: Bytes::from_static(b"task\r"),
+                        accepting: accepting.clone(),
+                    })
+                    .unwrap();
+                drop(write_tx);
+                run_writer(&mut writer, write_rx);
+                let input = accepting.lock().unwrap();
+                assert_eq!(input.pending_input, usize::from(fail_after.is_some()));
+                assert_eq!(input.last_input_delivery.is_some(), fail_after.is_none());
+            }
+        }
+
+        #[test]
+        fn submission_receipt_is_recorded_by_the_writer_before_async_acknowledgement() {
+            let receipt = InputSubmissionReceipt::default();
+            let (flushed, _flushed_rx) = std_mpsc::channel();
+            let mut writer = RecordingWriter {
+                writes: Vec::new(),
+                flushes: Vec::new(),
+                fail_after: None,
+                flushed,
+            };
+            let (write_tx, write_rx) = std_mpsc::channel();
+            let (reply, completion) = oneshot::channel();
+            write_tx
+                .send(PtyIoWriteCommand::SubmissionPart {
+                    receipt: Some(receipt.clone()),
+                    bytes: Bytes::from_static(b"\r"),
+                    deadline: None,
+                    reply,
+                    enter_completion: None,
+                })
+                .unwrap();
+            drop(write_tx);
+            run_writer(&mut writer, write_rx);
+            assert!(receipt.delivered_at().is_some());
+            completion.blocking_recv().unwrap().unwrap();
+        }
+
+        #[test]
+        fn raw_input_delivery_rejects_equal_clock_tick() {
+            let accepting = input_acceptance(true);
+            let delivered = Instant::now();
+            accepting.lock().unwrap().last_input_delivery = Some(delivered);
+            let (data_tx, _data_rx) = mpsc::channel(1);
+            let (control_tx, _control_rx) = std_mpsc::channel();
+            let (write_tx, _write_rx) = std_mpsc::channel();
+            let handle = PtyIoActorHandle {
+                data_tx,
+                control_tx,
+                write_tx,
+                response_order: Arc::new(Mutex::new(())),
+                accepting,
+            };
+            assert!(!handle.user_input_delivered_before(delivered));
+            assert!(handle.user_input_delivered_before(delivered + Duration::from_millis(1)));
         }
 
         #[test]

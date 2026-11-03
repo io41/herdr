@@ -110,6 +110,7 @@ pub enum AppEvent {
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {
         pane_id: PaneId,
+        observed_at: Instant,
         source: String,
         agent_label: String,
         state: AgentState,

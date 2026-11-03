@@ -478,6 +478,29 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    pub(crate) fn try_send_system_bytes(
+        &self,
+        bytes: Bytes,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.0.try_send_system_bytes(bytes)
+    }
+
+    pub fn has_pending_human_submission(&self) -> bool {
+        self.0.has_pending_human_submission()
+    }
+
+    pub(crate) fn observe_human_submission_state(
+        &self,
+        state: crate::detect::AgentState,
+        observed_at: std::time::Instant,
+    ) {
+        self.0.observe_human_submission_state(state, observed_at);
+    }
+
+    pub(crate) fn clear_human_submissions(&self) {
+        self.0.clear_human_submissions();
+    }
+
     pub(crate) fn validate_input_submission(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.0.validate_input_submission(bytes)
     }
@@ -488,7 +511,7 @@ impl TerminalRuntime {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
-    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+    ) -> std::io::Result<crate::terminal::UserInputCompletion> {
         self.0
             .queue_user_input_submission(text, enter, delay, deadline)
     }

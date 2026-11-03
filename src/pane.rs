@@ -1515,6 +1515,7 @@ pub struct PaneRuntime {
     self_reported_agent_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
+    human_input: Arc<Mutex<crate::terminal::human_input::HumanInputState>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
@@ -1642,6 +1643,14 @@ impl PaneRuntimeIo {
         }
     }
 
+    fn user_input_delivered_before(&self, observed_at: std::time::Instant) -> bool {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.user_input_delivered_before(observed_at),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => true,
+        }
+    }
+
     fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.write_terminal_response(response),
@@ -1660,15 +1669,27 @@ impl PaneRuntimeIo {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
+        receipt: crate::pty::actor::InputSubmissionReceipt,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                return actor.queue_user_input_submission_with_receipt(
+                    text,
+                    enter,
+                    delay,
+                    deadline,
+                    Some(receipt),
+                );
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    actor.queue_user_input_submission_with_receipt(
+                        text,
+                        enter,
+                        delay,
+                        Some(receipt),
+                    )
                 }
             }
             #[cfg(test)]
@@ -1684,6 +1705,9 @@ impl PaneRuntimeIo {
                             std::thread::sleep(delay);
                             sender.try_send(enter).map_err(std::io::Error::other)
                         });
+                    if result.is_ok() {
+                        receipt.mark_delivered();
+                    }
                     let _ = reply_tx.send(result);
                 });
                 Ok(reply_rx)
@@ -2676,6 +2700,7 @@ impl PaneRuntime {
             self_reported_agent_active,
             detect_reset_notify,
             pending_release,
+            human_input: Arc::default(),
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(detect_handle),
@@ -3289,6 +3314,7 @@ impl PaneRuntime {
             self_reported_agent_active,
             detect_reset_notify,
             pending_release,
+            human_input: Arc::default(),
             preserve_processes_on_drop: false,
             compression,
             detect_handle,
@@ -3671,7 +3697,48 @@ impl PaneRuntime {
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        let mut input = self
+            .human_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.io.try_send_bytes(bytes.clone())?;
+        input.record_bytes(&bytes);
+        Ok(())
+    }
+
+    /// Enqueue a known internal startup command or protocol control without recording human work.
+    pub(crate) fn try_send_system_bytes(
+        &self,
+        bytes: Bytes,
+    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes(bytes)
+    }
+
+    pub fn has_pending_human_submission(&self) -> bool {
+        self.human_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending()
+    }
+
+    pub(crate) fn observe_human_submission_state(
+        &self,
+        state: AgentState,
+        observed_at: std::time::Instant,
+    ) {
+        if self.io.user_input_delivered_before(observed_at) {
+            self.human_input
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .observe(state, observed_at);
+        }
+    }
+
+    pub(crate) fn clear_human_submissions(&self) {
+        self.human_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
 
     /// Preflight a complete API command without changing input queue semantics.
@@ -3695,9 +3762,17 @@ impl PaneRuntime {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
-    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
-        self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+    ) -> std::io::Result<crate::terminal::UserInputCompletion> {
+        let mut input = self
+            .human_input
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let has_text = !text.is_empty();
+        let receipt = crate::pty::actor::InputSubmissionReceipt::default();
+        let completion =
+            self.io
+                .queue_user_input_submission(text, enter, delay, deadline, receipt.clone())?;
+        Ok(input.queue(completion, self.human_input.clone(), has_text, receipt))
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -4083,6 +4158,7 @@ impl PaneRuntime {
                 self_reported_agent_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
+                human_input: Arc::default(),
                 preserve_processes_on_drop: true,
                 compression,
                 detect_handle: Some(tokio::spawn(async {}).abort_handle()),
@@ -4096,6 +4172,25 @@ impl PaneRuntime {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[tokio::test]
+    async fn internal_startup_and_protocol_writes_preserve_human_input_tracking() {
+        let (runtime, mut input) = PaneRuntime::test_with_channel(80, 24);
+        for bytes in [b"codex resume saved-session\r".as_slice(), b"\x1b[1;1R"] {
+            runtime
+                .try_send_system_bytes(Bytes::copy_from_slice(bytes))
+                .unwrap();
+            assert_eq!(input.try_recv().unwrap().as_ref(), bytes);
+            runtime.observe_human_submission_state(AgentState::Idle, std::time::Instant::now());
+            assert!(!runtime.has_pending_human_submission());
+        }
+        runtime.try_send_bytes(Bytes::from_static(b"\r")).unwrap();
+        assert!(runtime.has_pending_human_submission());
+        runtime
+            .try_send_system_bytes(Bytes::from_static(b"\x1b[1;1R"))
+            .unwrap();
+        assert!(runtime.has_pending_human_submission());
+    }
 
     #[tokio::test]
     async fn unidentified_text_cache_tracks_runtime_mutations_not_viewport_scroll() {
@@ -5435,6 +5530,7 @@ mod tests {
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            human_input: Arc::default(),
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),
@@ -5475,6 +5571,7 @@ mod tests {
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
+            human_input: Arc::default(),
             preserve_processes_on_drop: true,
             compression,
             detect_handle: Some(tokio::spawn(async {}).abort_handle()),

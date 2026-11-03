@@ -1,6 +1,6 @@
 # Agent inbox in the custom fork
 
-The agent inbox groups conversations by the attention they need. This feature belongs to the `io41/herdr` custom fork and starts disabled. Existing flat Agents navigation remains available. After isolated acceptance, use the global menu item **agent inbox / flat** to switch views. Section toggles and **conversation actions...** are available in the same menu.
+The agent inbox groups conversations by the attention they need. This feature belongs to the `io41/herdr` custom fork and starts disabled. Existing flat Agents navigation remains available. Use the **agent view** selector to switch views. Section toggles are in that selector; **conversation actions** opens the focused conversation menu.
 
 ## Conversation sections
 
@@ -12,43 +12,72 @@ The agent inbox groups conversations by the attention they need. This feature be
 
 Working and Settled start collapsed with visible counts. Section expansion and the selected presentation mode are client preferences. Settlement belongs to the conversation on its owning server.
 
-## Open, settle, reopen, and resume
+## Identify a conversation
 
-Open focuses the selected live attachment or shows saved details for a closed conversation. Opening does not settle or reopen it. When a conversation has several live attachments, choose the one to open.
+Each inbox row shows a meaningful conversation, pane, or tab title and a Space, tab, and pane breadcrumb. Numeric default tab names use the Space and pane as the fallback. Closed conversations show their last known location. The provider and complete status remain visible without repeating Local for a single local endpoint.
 
-Settle puts reviewed work in Settled without closing its terminal. Active execution, queued human work, and unresolved requests prevent settlement. Settle requires native session identity and known idle or closed state. Pending or uncertain resume also prevents settlement. Reopen returns the conversation to Inbox without starting an agent.
+The view selector offers Inbox, All agents by space, and All agents by attention. Inbox groups by lifecycle. The two All agents views retain the configurable agent rows with different ordering.
 
-Resume explicitly continues the saved provider session. Herdr reuses a live attachment instead of starting a duplicate. A new launch remains pending until the provider reports the matching native session. Codex reports that identity on your next user turn. Open the reserved terminal to continue; Herdr does not send a prompt automatically. An uncertain result remains visible and blocks duplicate launch attempts. Herdr never silently substitutes a new conversation.
+## Open, settle, and restore
 
-## Recover a closed session
+Open focuses a live conversation without changing its settlement state. Settle saves its native session reference and last location, then closes its sole agent process and pane. It may also remove an empty tab or Space through the normal pane-close behavior. Other panes remain running. Working agents, queued input, drafts, unanswered requests, unknown state, or ambiguous duplicate attachments prevent settlement; the action shows the reason.
 
-The saved location identifies the original Space, tab, and working directory. If the original destination still exists, resume creates a pane there. If a tab or Space has been removed, choose whether to recreate it or use another location. Names and sidebar positions do not identify a destination.
+Restore is the single action for settled or closed conversations. It reuses an existing attachment or starts the exact saved native session in a new pane, then focuses it. Herdr first matches durable location IDs, then unique existing Space and tab names. It creates only missing containers. Duplicate matching names or a missing working directory prompt for the specific missing choice rather than showing all recovery options in advance.
 
-A missing working directory requires an explicit valid replacement path. Resume does not recreate a removed worktree. An unavailable endpoint, unsupported provider, or missing native session produces a recovery message rather than a fresh session.
+A new process remains unconfirmed until the provider reports the matching native session. Choose **Open restored session**, then submit your next Codex prompt to confirm the session identity. Herdr does not send a prompt automatically. An uncertain result blocks duplicate launch attempts. Herdr never silently substitutes a new conversation.
 
-Closing a pane does not settle its conversation. Outstanding attention stays in Inbox with a Closed label. Settled history and the session navigator retain authoritative session records after closure and restart. Search the navigator by conversation title to find closed sessions. Provisional identities without a native session are not durable resume targets.
+## Keyboard actions and restart
+
+The default prefix is Ctrl+B. Your imported profile keeps Cmd+P for the session navigator and Ctrl+B then a for Latch. Conversation actions therefore use Ctrl+B then Shift+A.
+
+| Keys | Action |
+| --- | --- |
+| Ctrl+B, then Shift+A | Conversation actions for the focused or selected conversation. |
+| Ctrl+B, then i | View selector, including section expansion controls. |
+| Cmd+P in your imported profile | Search Spaces, tabs, panes, and saved conversations. The stock default is Ctrl+B, then g. |
+| Up/Down or j/k in a menu | Select an item. |
+| Enter in a menu | Perform the selected available action. |
+| s in conversation actions | Settle and close the eligible conversation. |
+| r in conversation actions | Restore the conversation. |
+| Esc | Close the menu without acting. |
+| Ctrl+B, then q | Detach the client without stopping the server. |
+
+The action and view shortcuts are client fallbacks; explicit configured bindings take precedence. Ordinary letters in an agent terminal remain agent input.
+
+Installing a new binary does not replace an already running server. Finish active work, detach, and run these commands from a separate terminal outside Herdr. Stopping the server exits all of that session's pane processes:
+
+```sh
+herdr-inbox server stop
+herdr-inbox
+```
+
+This restarts the default inbox session and restores its saved layout and resumable native conversations. For another named session, use `herdr-inbox --session NAME server stop`, then `herdr-inbox --session NAME`. Shell-job memory does not survive a restart.
 
 ## Provider limits
 
 Status detection and native session identity are different signals. A running process does not prove that an agent is working or waiting for input. Herdr shows the distinctions supported by the provider and keeps unknown state visible.
 
-Terminal input does not automatically reopen settled conversations. Use explicit Reopen or Resume. Blocked status appears as Needs input; the current integration does not distinguish approvals, questions, or failures. Prompts submitted through the agent API reopen conversations after successful submission. A successful command submission does not prove that the provider accepted the requested native session.
+Terminal input does not automatically reopen settled conversations. Use **Restore**. Blocked status appears as Needs input; the current integration does not distinguish approvals, questions, or failures. Prompts submitted through the agent API reopen conversations after successful submission. A successful command submission does not prove that the provider accepted the requested native session.
+
+Exiting Codex does not automatically settle its conversation. Codex 0.166 reports `SessionEnd.reason` as `other`, including for shutdown and disconnected-thread unload. `SessionStart` does not distinguish a manual resume from an automatic restore. These signals cannot establish the user's intent. See the [Codex hooks documentation](https://learn.chatgpt.com/docs/hooks).
 
 Pins, snooze, automatic settlement, and worktree cleanup are outside this delivery.
 
 ## Test the local copy
 
-Run `herdr-inbox` from a separate terminal. The local launcher uses its own configuration, state directory, and named session, with the inbox enabled. Your usual `herdr` command and existing sessions remain separate. Test sessions begin empty; the launcher does not copy your current workspaces, conversations, or Herdr plugins. Providers that use XDG configuration paths may need separate setup. Codex and Claude keep their usual configuration homes.
+Run `herdr-inbox` from a separate terminal. The local launcher uses its own configuration, state directory, and named session, with the inbox enabled. Your usual `herdr` command and existing sessions remain separate. Normal settings and all installed Herdr plugins have been imported into isolated copies. Launching the test copy does not itself copy current workspaces or conversations; use the switcher below for session transfer. Providers that use XDG configuration paths may need separate setup. Codex and Claude keep their usual configuration homes.
 
-Start an agent normally and submit a task. Check Working, completion returning to Inbox, explicit Settle, closed-session recovery, and Resume. For Codex, continue with a prompt after Resume to confirm native session identity.
+The imported profile includes gruvbox, custom keys and widgets, Palette, pane movement, Latch, and all five installed plugins. Its files are separate copies. The original inbox configuration is backed up under `~/.config/herdr-inbox/herdr/.import-backup-20261103T101720`. Restart the inbox server to load the imported settings and plugins. Use `herdr-inbox` for configuration and plugin commands so they target the isolated profile.
+
+Start an agent normally and submit a task. Check Working, completion returning to Inbox, explicit Settle, and Restore. For Codex, continue with a prompt after Restore to confirm native session identity.
 
 Detaching the client keeps the test server and its pane processes running. To stop them, run `herdr-inbox server stop`. This exits all test-pane processes in the isolated session.
 
 ## Agent skills
 
-Existing Herdr pane commands and the installed `herdr` skill keep their current semantics. Pane `idle` or `done` status does not imply that a conversation is settled. No global `AGENTS.md` rule is needed for this user interface.
+Existing Herdr pane commands and the installed `herdr` skill keep their current semantics. Pane `idle` or `done` status does not imply that a conversation is settled. Explicit Settle closes the conversation pane; simply exiting a provider is not automatically treated as settlement. No global `AGENTS.md` rule is needed for this user interface.
 
-Agents that automate the new lifecycle need the fork's advertised `agent.conversation.list`, `agent.conversation.open`, `agent.conversation.settle`, `agent.conversation.reopen`, and `agent.conversation.resume` JSON methods. There are no corresponding conversation CLI subcommands. Gate these calls on endpoint method support and request settlement only when the user asks for it.
+Agents that automate the new lifecycle need the fork's advertised `agent.conversation.list`, `agent.conversation.open`, `agent.conversation.settle`, `agent.conversation.reopen`, `agent.conversation.resume`, `agent.conversation.settle_and_close`, and `agent.conversation.restore` JSON methods. The UI's **Settle** action calls `agent.conversation.settle_and_close`. The original `agent.conversation.settle` changes settlement state without closing the pane. The original resume method also retains its earlier semantics; the new UI uses `agent.conversation.restore` for automatic placement. There are no corresponding conversation CLI subcommands. Gate these calls on endpoint method support and request settlement only when the user asks for it.
 
 The bundled `skills/herdr/SKILL.md` remains aligned with the latest stable release, as required by the repository's documentation policy. Fork-specific instructions stay in this guide until stable release preparation.
 

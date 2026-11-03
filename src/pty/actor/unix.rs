@@ -10,6 +10,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{self, error::TryRecvError as DataTryRecvError};
 use tracing::{debug, warn};
 
+use super::InputSubmissionReceipt;
 use crate::pty::fd;
 
 // Actor handle methods must call wake_actor() after queuing work. The idle
@@ -74,6 +75,7 @@ pub(crate) struct PtyIoActorConfig {
 enum PtyIoDataCommand {
     WriteUserInput(Bytes),
     SubmitUserInput {
+        receipt: Option<InputSubmissionReceipt>,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
@@ -101,9 +103,11 @@ pub(crate) struct PtyIoActorHandle {
     input_guard: crate::platform::PtyInputGuard,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct UserWriteGate {
     accepting: bool,
+    pending_input: usize,
+    last_input_delivery: Option<Instant>,
 }
 
 impl PtyIoActorHandle {
@@ -115,18 +119,20 @@ impl PtyIoActorHandle {
         &self,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
-        let user_writes = self
+        let mut user_writes = self
             .user_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !user_writes.accepting {
             return Err(mpsc::error::TrySendError::Closed(bytes));
         }
+        let nonempty = !bytes.is_empty();
         match self
             .data_tx
             .try_send(PtyIoDataCommand::WriteUserInput(bytes))
         {
             Ok(()) => {
+                user_writes.pending_input += usize::from(nonempty);
                 self.wake_actor();
                 Ok(())
             }
@@ -145,11 +151,33 @@ impl PtyIoActorHandle {
         }
     }
 
+    pub(crate) fn user_input_delivered_before(&self, observed_at: Instant) -> bool {
+        let input = self
+            .user_writes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        input.pending_input == 0
+            && input
+                .last_input_delivery
+                .is_none_or(|delivered| delivered < observed_at)
+    }
+
+    #[cfg(test)]
     pub(crate) fn queue_user_input_submission(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_user_input_submission_with_receipt(text, enter, delay, None)
+    }
+
+    pub(crate) fn queue_user_input_submission_with_receipt(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        receipt: Option<InputSubmissionReceipt>,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
@@ -164,6 +192,7 @@ impl PtyIoActorHandle {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.data_tx
             .try_send(PtyIoDataCommand::SubmitUserInput {
+                receipt,
                 text,
                 enter,
                 delay,
@@ -395,6 +424,7 @@ impl PtyIoActor {
         let wake_pipe = fd::create_wake_pipe()?;
         let user_writes = Arc::new(Mutex::new(UserWriteGate {
             accepting: !config.initially_quiesced,
+            ..UserWriteGate::default()
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
@@ -403,7 +433,7 @@ impl PtyIoActor {
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
-            user_writes,
+            user_writes: Arc::clone(&user_writes),
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
             input_guard: crate::platform::PtyInputGuard::new(&file),
@@ -420,6 +450,7 @@ impl PtyIoActor {
                 ActorState::Running
             },
             pending_writes: VecDeque::new(),
+            user_writes,
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,
@@ -454,6 +485,7 @@ struct PtyIoActorRunner {
     control_rx: std_mpsc::Receiver<PtyIoControlCommand>,
     state: ActorState,
     pending_writes: VecDeque<PendingWrite>,
+    user_writes: Arc<Mutex<UserWriteGate>>,
     current_write_offset: usize,
     active_submission: Option<ActiveSubmission>,
     pending_handoff: Option<std_mpsc::Sender<std::io::Result<()>>>,
@@ -466,6 +498,7 @@ struct PtyIoActorRunner {
 }
 
 struct ActiveSubmission {
+    receipt: Option<InputSubmissionReceipt>,
     enter: Bytes,
     delay: Duration,
     phase: SubmissionPhase,
@@ -482,6 +515,7 @@ struct PendingWrite {
 enum SubmissionBoundary {
     Text,
     Enter,
+    UserInput,
 }
 
 enum SubmissionPhase {
@@ -645,10 +679,11 @@ impl PtyIoActorRunner {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
-                    self.enqueue_write(bytes);
+                    self.enqueue_submission_write(bytes, SubmissionBoundary::UserInput);
                 }
             }
             PtyIoDataCommand::SubmitUserInput {
+                receipt,
                 text,
                 enter,
                 delay,
@@ -662,6 +697,7 @@ impl PtyIoActorRunner {
                         SubmissionPhase::WritingText
                     };
                     self.active_submission = Some(ActiveSubmission {
+                        receipt,
                         enter,
                         delay,
                         phase,
@@ -866,6 +902,14 @@ impl PtyIoActorRunner {
 
     fn complete_submission_boundary(&mut self, boundary: SubmissionBoundary) {
         match boundary {
+            SubmissionBoundary::UserInput => {
+                let mut input = self
+                    .user_writes
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                input.pending_input = input.pending_input.saturating_sub(1);
+                input.last_input_delivery = Some(Instant::now());
+            }
             SubmissionBoundary::Text => {
                 let Some(submission) = self.active_submission.as_mut() else {
                     return;
@@ -878,6 +922,9 @@ impl PtyIoActorRunner {
                     return;
                 };
                 debug_assert!(matches!(submission.phase, SubmissionPhase::WritingEnter));
+                if let Some(receipt) = &submission.receipt {
+                    receipt.mark_delivered();
+                }
                 let _ = submission.reply.send(Ok(()));
             }
         }
@@ -896,6 +943,9 @@ impl PtyIoActorRunner {
             let enter = enter.clone();
             if enter.is_empty() {
                 let submission = self.active_submission.take().unwrap();
+                if let Some(receipt) = &submission.receipt {
+                    receipt.mark_delivered();
+                }
                 let _ = submission.reply.send(Ok(()));
             } else {
                 self.active_submission.as_mut().unwrap().phase = SubmissionPhase::WritingEnter;
@@ -952,7 +1002,11 @@ impl PtyIoActorRunner {
                         self.current_write_offset = 0;
                         if let Some(boundary) = completed.boundary {
                             self.file.as_ref().flush()?;
-                            return Ok(Some(boundary));
+                            if boundary == SubmissionBoundary::UserInput {
+                                self.complete_submission_boundary(boundary);
+                            } else {
+                                return Ok(Some(boundary));
+                            }
                         }
                     }
                 }
@@ -1110,6 +1164,7 @@ mod tests {
             control_rx,
             state: ActorState::Running,
             pending_writes: VecDeque::new(),
+            user_writes: Arc::new(Mutex::new(UserWriteGate::default())),
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,
@@ -1130,6 +1185,104 @@ mod tests {
         assert!(!runner.handle_data_command(PtyIoDataCommand::WriteUserInput(Bytes::new())));
 
         assert!(runner.pending_writes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_human_input_requires_a_work_cycle_after_actual_delivery() {
+        use crate::detect::AgentState;
+
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
+        runner.data_rx = data_rx;
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read) = test_wake_pair();
+        runner.user_writes.lock().unwrap().accepting = true;
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: runner.user_writes.clone(),
+            controls: runner.controls.clone(),
+            response_order: runner.response_order.clone(),
+            input_guard: Default::default(),
+        };
+        let runtime = crate::terminal::TerminalRuntime::test_with_actor(handle.clone());
+
+        runtime
+            .try_send_bytes(Bytes::from_static(b"task\r"))
+            .unwrap();
+        let before_delivery = Instant::now();
+        runtime.observe_human_submission_state(AgentState::Working, before_delivery);
+        runtime.observe_human_submission_state(AgentState::Idle, Instant::now());
+        assert!(runtime.has_pending_human_submission());
+        assert!(!handle.user_input_delivered_before(Instant::now()));
+
+        assert!(!runner.drain_data_commands());
+        assert_eq!(runner.flush_pending_writes_once().unwrap(), None);
+        let mut bytes = [0; 5];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"task\r");
+        let delivered = handle
+            .user_writes
+            .lock()
+            .unwrap()
+            .last_input_delivery
+            .unwrap();
+        let working = delivered + Duration::from_millis(1);
+        let completion = working + Duration::from_millis(1);
+        assert!(!handle.user_input_delivered_before(delivered));
+        assert!(handle.user_input_delivered_before(working));
+
+        runtime.observe_human_submission_state(AgentState::Working, before_delivery);
+        runtime.observe_human_submission_state(AgentState::Idle, working);
+        assert!(runtime.has_pending_human_submission());
+        runtime.observe_human_submission_state(AgentState::Working, delivered);
+        runtime.observe_human_submission_state(AgentState::Idle, working);
+        assert!(
+            runtime.has_pending_human_submission(),
+            "equal delivery tick is not fresh work evidence"
+        );
+        runtime.observe_human_submission_state(AgentState::Working, working);
+        runtime.observe_human_submission_state(AgentState::Idle, completion);
+        assert!(!runtime.has_pending_human_submission());
+    }
+
+    #[test]
+    fn failed_raw_write_keeps_the_delivery_barrier() {
+        let (mut runner, peer) = actor_runner_for_unit_test();
+        runner.user_writes.lock().unwrap().pending_input = 1;
+        runner
+            .enqueue_submission_write(Bytes::from_static(b"task\r"), SubmissionBoundary::UserInput);
+        drop(peer);
+
+        assert!(runner.flush_pending_writes_once().is_err());
+        assert_eq!(runner.user_writes.lock().unwrap().pending_input, 1);
+    }
+
+    #[test]
+    fn submission_receipt_precedes_completion_receiver_wakeup() {
+        let (mut runner, mut peer) = actor_runner_for_unit_test();
+        let receipt = InputSubmissionReceipt::default();
+        let (reply, completion) = std_mpsc::channel();
+        runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+            receipt: Some(receipt.clone()),
+            text: Bytes::from_static(b"task"),
+            enter: Bytes::from_static(b"\r"),
+            delay: Duration::ZERO,
+            reply,
+        });
+        assert!(receipt.delivered_at().is_none());
+        let boundary = runner.flush_pending_writes_once().unwrap().unwrap();
+        runner.complete_submission_boundary(boundary);
+        assert!(receipt.delivered_at().is_none());
+        runner.schedule_submission_enter();
+        let boundary = runner.flush_pending_writes_once().unwrap().unwrap();
+        runner.complete_submission_boundary(boundary);
+        assert!(receipt.delivered_at().is_some());
+        completion.recv().unwrap().unwrap();
+        let mut bytes = [0; 5];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"task\r");
     }
 
     #[test]
@@ -1646,7 +1799,10 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate {
+                accepting: true,
+                ..UserWriteGate::default()
+            })),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
             input_guard: Default::default(),
@@ -1706,6 +1862,7 @@ mod tests {
             control_rx,
             state: ActorState::Running,
             pending_writes: VecDeque::new(),
+            user_writes: Arc::new(Mutex::new(UserWriteGate::default())),
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,
@@ -1726,7 +1883,10 @@ mod tests {
             data_tx,
             control_tx,
             wake: wake_pipe.writer,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate {
+                accepting: true,
+                ..UserWriteGate::default()
+            })),
             controls,
             response_order,
             input_guard: crate::platform::PtyInputGuard::new(&runner.file),
@@ -1796,7 +1956,10 @@ mod tests {
             data_tx,
             control_tx,
             wake,
-            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            user_writes: Arc::new(Mutex::new(UserWriteGate {
+                accepting: true,
+                ..UserWriteGate::default()
+            })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
             input_guard: Default::default(),
@@ -1843,6 +2006,7 @@ mod tests {
             control_rx,
             state: ActorState::Running,
             pending_writes: VecDeque::new(),
+            user_writes: Arc::new(Mutex::new(UserWriteGate::default())),
             current_write_offset: 0,
             active_submission: None,
             pending_handoff: None,

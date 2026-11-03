@@ -87,3 +87,86 @@ async fn conversation_companion_streams_once_to_active_and_inactive_clients() {
     assert_eq!(server.default_shell_target(), focus_before);
     assert!(!server.clients[&92].shell_surface_active);
 }
+
+#[tokio::test]
+async fn restore_updates_only_requesting_client_location_before_success_response() {
+    let mut server = test_headless_server();
+    server
+        .app
+        .state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("saved"));
+    server
+        .app
+        .state
+        .workspaces
+        .push(crate::workspace::Workspace::test_new("foreground"));
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(1);
+    let pane = server.app.state.workspaces[0].tabs[0].root_pane;
+    let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane]
+        .attached_terminal_id
+        .clone();
+    let terminal = server.app.state.terminals.get_mut(&terminal_id).unwrap();
+    terminal.set_detected_state(
+        Some(crate::detect::Agent::Codex),
+        crate::detect::AgentState::Idle,
+    );
+    terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+        source: "herdr:codex".into(),
+        agent: "codex".into(),
+        session_ref: crate::agent_resume::AgentSessionRef::id("restore-client-test").unwrap(),
+    });
+    server.app.sync_agent_conversations();
+    let record = server.app.agent_inbox.records().remove(0);
+    let record = server
+        .app
+        .agent_inbox
+        .mutate(
+            &record.id,
+            record.revision,
+            crate::agent_inbox::ConversationAction::Settle,
+            1,
+        )
+        .unwrap();
+    let (active, _) = connect_matching_test_shell(&mut server, 91);
+    let (inactive, _) = connect_matching_test_shell(&mut server, 92);
+    let _ = client_shell_snapshot(&active);
+    let _ = client_shell_snapshot(&inactive);
+    server.clients.get_mut(&92).unwrap().shell_surface_active = false;
+    server.foreground_client_id = Some(91);
+    let previous = server.shell_target_for_client(91);
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_client_conversation_request(
+        92,
+        api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "restore".into(),
+                method: api::schema::Method::AgentConversationRestore(
+                    api::schema::AgentConversationRestoreParams {
+                        conversation_id: record.id,
+                        expected_revision: record.revision,
+                        location: None,
+                        cwd: None,
+                    },
+                ),
+            },
+            respond_to,
+            response_write_complete: None,
+        },
+    );
+    let response: serde_json::Value =
+        serde_json::from_str(&response_rx.try_recv().unwrap()).unwrap();
+    assert_eq!(response["result"]["result"]["status"], "uncertain");
+    assert_eq!(
+        response["result"]["result"]["pane_id"],
+        server.app.public_pane_id(0, pane).unwrap()
+    );
+    assert_eq!(
+        server.shell_target_for_client(92).unwrap().workspace_index,
+        0
+    );
+    assert_eq!(server.shell_target_for_client(91), previous);
+    assert_eq!(server.foreground_client_id, Some(91));
+    assert!(!server.clients[&92].shell_surface_active);
+}

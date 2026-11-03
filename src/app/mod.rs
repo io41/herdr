@@ -408,10 +408,23 @@ impl App {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
+        let agent_inbox_boot_id = crate::terminal::TerminalId::alloc().to_string();
+        let agent_inbox = crate::agent_inbox::InboxRegistry::load(
+            policy
+                .persist_session
+                .then(|| crate::session::data_dir().join("agent-conversations.json")),
+            agent_inbox_boot_id.clone(),
+        );
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-        let snapshot = policy.restore_session.then(crate::persist::load).flatten();
+        let mut snapshot = policy.restore_session.then(crate::persist::load).flatten();
+        let mut history = (snapshot.is_some() && config.experimental.pane_history)
+            .then(crate::persist::load_history)
+            .flatten();
+        if let Some(snapshot) = snapshot.as_mut() {
+            snapshot.prune_retired_terminals(&agent_inbox.retired_terminal_ids(), history.as_mut());
+        }
         let mut plugin_installation_leases = crate::plugin_installations::Leases::new();
         let mut plugin_installation_cleanup_allowed = true;
         if policy.persist_plugin_registry {
@@ -433,11 +446,6 @@ impl App {
             policy.restore_session && snapshot.is_none(),
         )));
         let (workspaces, active, selected) = if let Some(snap) = snapshot {
-            let history = config
-                .experimental
-                .pane_history
-                .then(crate::persist::load_history)
-                .flatten();
             let (ws, terminals, terminal_runtimes) = crate::persist::restore(
                 &snap,
                 history.as_ref(),
@@ -625,13 +633,6 @@ impl App {
         let endpoint_commands =
             custom_commands::EndpointCommandRegistry::new(&state.keybinds.custom_commands);
 
-        let agent_inbox_boot_id = crate::terminal::TerminalId::alloc().to_string();
-        let agent_inbox = crate::agent_inbox::InboxRegistry::load(
-            policy
-                .persist_session
-                .then(|| crate::session::data_dir().join("agent-conversations.json")),
-            agent_inbox_boot_id.clone(),
-        );
         let mut app = Self {
             agent_inbox,
             agent_inbox_boot_id,
@@ -3290,6 +3291,135 @@ mod tests {
         releaser.join().unwrap();
         done_rx.try_recv().unwrap();
         assert!(app.session_save_thread.is_none());
+    }
+
+    #[test]
+    fn intentional_close_checkpoint_joins_an_older_untagged_background_save() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("conversation-close-checkpoint-join");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_session = std::env::var_os(crate::session::SESSION_ENV_VAR);
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.state.workspaces = vec![Workspace::test_new("current")];
+        app.state.ensure_test_terminals();
+        let mut older = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            Some(0),
+            0,
+        );
+        for pane in older.workspaces[0].tabs[0].panes.values_mut() {
+            pane.terminal_id = None;
+        }
+        older.workspaces[0].custom_name = Some("older untagged snapshot".into());
+        let writer = app.session_writer.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        app.session_save_thread = Some(std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            writer.lock().unwrap().save(&older, None);
+        }));
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            release_tx.send(()).unwrap();
+        });
+        app.checkpoint_session_before_conversation_close().unwrap();
+        releaser.join().unwrap();
+        assert!(app.session_save_thread.is_none());
+        let saved = crate::persist::load().unwrap();
+        assert_eq!(saved.workspaces[0].custom_name.as_deref(), Some("current"));
+        let pane = saved.workspaces[0].tabs[0].panes.values().next().unwrap();
+        let actual = app.state.workspaces[0].tabs[0]
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .attached_terminal_id
+            .to_string();
+        assert_eq!(pane.terminal_id.as_deref(), Some(actual.as_str()));
+        if let Some(value) = previous_config {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Some(value) = previous_session {
+            std::env::set_var(crate::session::SESSION_ENV_VAR, value);
+        } else {
+            std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        }
+        std::fs::remove_dir_all(config_home).unwrap();
+    }
+
+    #[test]
+    fn intentional_close_before_debounced_save_is_pruned_before_startup_agent_restore() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("conversation-close-crash-recovery");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_session = std::env::var_os(crate::session::SESSION_ENV_VAR);
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.agent_inbox = crate::agent_inbox::InboxRegistry::load(
+            Some(crate::session::data_dir().join("agent-conversations.json")),
+            "before-crash".into(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("last-pane")];
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("closed-before-crash").unwrap(),
+        });
+        app.sync_agent_conversations();
+        app.checkpoint_session_before_conversation_close().unwrap();
+        let record = app.agent_inbox.records().pop().unwrap();
+        app.agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                crate::agent_inbox::ConversationAction::SettleAndClose,
+                100,
+            )
+            .unwrap();
+        // Crash after committing the tombstone, before the close layout can autosave.
+        assert_eq!(crate::persist::load().unwrap().workspaces.len(), 1);
+        drop(app);
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.session.resume_agents_on_restore = true;
+        let restored = App::new(
+            &config,
+            AppPolicy {
+                restore_session: true,
+                persist_session: true,
+                ..AppPolicy::TEST
+            },
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        assert!(restored.state.workspaces.is_empty());
+        assert!(restored.state.terminals.is_empty());
+        assert_eq!(restored.terminal_runtimes.len(), 0);
+        assert_eq!(restored.agent_inbox.retired_terminal_ids().len(), 1);
+        drop(restored);
+        if let Some(value) = previous_config {
+            std::env::set_var("XDG_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        if let Some(value) = previous_session {
+            std::env::set_var(crate::session::SESSION_ENV_VAR, value);
+        } else {
+            std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        }
+        std::fs::remove_dir_all(config_home).unwrap();
     }
 
     #[tokio::test]

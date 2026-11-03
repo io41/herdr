@@ -8,15 +8,15 @@ The final section order is Pinned, Inbox, Working, Snoozed, Settled. Pinned and 
 
 | ID | Requirement |
 | --- | --- |
-| R1 | Preserve Spaces, workspace membership, tabs, pane geometry, and terminal ownership. Settling never closes, moves, or sends input to a pane. |
+| R1 | Explicit UI Settle durably saves the conversation and closes its sole eligible agent and pane. Preserve unrelated processes and containers; closing the last pane may remove an empty tab or Space. Retain names and native identity for Restore. |
 | R2 | Keep execution state, read acknowledgement, and conversation disposition independent. Viewing a completed result clears unread attention without settling it. Browsing Settled does not reopen the conversation. |
 | R3 | Project active execution into Working. Return ordinary completion to Inbox even when the pane was visible during completion. A new approval or question returns immediately. |
-| R4 | Settle is explicit, reversible, and durable. Reopen returns the conversation to Inbox. Reject Settle during active execution, queued human work, or an unresolved blocking request. |
+| R4 | Settle is explicit, reversible, and durable. Reopen returns the conversation to Inbox. Reject Settle during active execution, queued or unconfirmed human input, or an unresolved blocking request. Checked session persistence and generation tombstones must prevent a settled pane from reappearing after restart. |
 | R5 | Collapse Working and Settled by default. Persist expansion preferences per client. Disposition is shared by clients connected to the owning endpoint. |
 | R6 | Inbox sorts newest attention return first. Working sorts latest real human submission first. Settled sorts newest settlement first. Break equal timestamps by stable conversation identity. Reading and autonomous continuation do not reorder Inbox. |
 | R7 | A verified new human submission reopens settled work. Provider events must distinguish this from automatic continuation. If that signal is unavailable, require explicit Reopen and disclose the limitation. |
 | R8 | Preserve disposition across pane moves, detach, reconnect, and restart when conversation identity is authoritative. A new conversation in an old pane must not inherit settlement. Ambiguous identity remains visible. |
-| R9 | Mouse targeting, numbered shortcuts, next/previous navigation, and displayed row order use the same projection. Headers are not agent targets. If the selected row disappears, choose the next visible agent, then the previous one, or no agent. Do not move terminal focus automatically. |
+| R9 | Mouse targeting, numbered shortcuts, next/previous navigation, and displayed row order use the same projection. Headers are not agent targets. If the selected row disappears, choose the next visible agent, then the previous one, or no agent. Background projection changes do not move terminal focus. Explicit Open and Restore focus their target pane. |
 | R10 | Keep hidden work recoverable through expanded sections, an All picker, and existing Spaces navigation. Endpoint failure leaves its rows visible and marked unavailable. Never infer completion or settlement from a disconnect. |
 | R11 | Unknown execution or identity must not silently hide work. Preserve a visible fallback when the server lacks the capability. |
 | R12 | Notifications and attention counts follow the lifecycle projection. Reading suppresses an unread indicator, not pending-work membership. Restore must not replay historical completion notifications. |
@@ -29,8 +29,8 @@ A row represents a conversation, including when its terminal is closed. Show its
 | ID | Requirement |
 | --- | --- |
 | R18 | Open focuses an existing attachment or shows saved details for a closed conversation. Opening never changes disposition. Multiple attachments require an explicit attachment choice. |
-| R19 | Reopen returns a conversation to Inbox without starting a process. Resume explicitly reopens and continues the exact saved provider session. A verified attachment clears settlement; active execution projects to Working. Never substitute a new session. |
-| R20 | Resume reuses an existing attachment. Otherwise create a pane in the original tab. If the tab or Space no longer exists, offer explicit recreation or a location choice. Do not silently use the current tab. Match durable location identities rather than names or positions. |
+| R19 | Restore is the single UI action for settled or closed conversations. Reuse an existing attachment or launch the exact saved session, and focus that pane. Unconfirmed native attachment remains distinct. Legacy Reopen and Resume API methods keep their prior semantics. |
+| R20 | Restore first uses durable location identity, then unique saved Space and displayed tab names as a placement preference. Reuse the matching tab, otherwise create only missing containers. Ask for a destination only when matching names are ambiguous. Never infer conversation identity from a name or silently use an unrelated current tab. |
 | R21 | A missing directory or worktree requires an explicit valid replacement path. Never recreate a worktree automatically. Disconnected endpoints, unsupported resume, missing sessions, and ambiguous identity remain visible with recovery information. |
 | R22 | A definitive resume failure preserves disposition and reports the error. An uncertain launch projects to Inbox as Status unknown. Reconcile existing attachments before allowing a retry so a timeout cannot create duplicate execution. |
 | R23 | Closed conversations remain searchable in Settled and All conversations. Retain native identity and saved location across pane closure and restart. Do not persist provisional identities as resumable history. |
@@ -50,7 +50,7 @@ For ordinary completion, hold the row in Working for two seconds to avoid flicke
 ## Exclusions and decisions
 
 - Do not add inactivity-based or PR-based automatic settlement in either delivery. Pins therefore have no automatic-settlement policy in this scope.
-- Retain terminal panes when settling. Closing a pane retains its authoritative conversation record and saved location. Closure never implies settlement; outstanding work remains visible in Inbox with a Closed label.
+- Settle intentionally closes its sole conversation pane after checked persistence. Other pane closures, process exits, and disconnects do not silently settle work. Preserve the conversation and saved location after closure.
 - Do not add provider switching, remote orchestration, PR monitoring, scheduling prompts, or automatic worktree cleanup.
 - Do not change status detection to make the sidebar appear correct. Report unsupported semantic signals as capability limits.
 - If duplicate pane attachments resolve to the same authoritative conversation, show one conversation row with an attachment picker. Never choose a target attachment from sidebar position alone.

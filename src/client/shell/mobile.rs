@@ -1235,10 +1235,7 @@ fn append_inbox_items(
             items.push(MobileItem {
                 lines: vec![
                     Line::from(Span::styled(
-                        crate::ui::truncate_end(
-                            &format!("  {}{}", if unread { "● " } else { "" }, row.label),
-                            usize::from(content_width),
-                        ),
+                        super::agent_inbox::row_headline(row, usize::from(content_width), unread),
                         Style::default()
                             .fg(foreground)
                             .bg(background)
@@ -1246,7 +1243,7 @@ fn append_inbox_items(
                     )),
                     Line::from(Span::styled(
                         crate::ui::truncate_end(
-                            &format!("  {}", row.detail),
+                            &super::agent_inbox::row_detail(row, usize::from(content_width)),
                             usize::from(content_width),
                         ),
                         Style::default().fg(palette.overlay0).bg(background),

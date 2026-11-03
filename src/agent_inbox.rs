@@ -59,6 +59,10 @@ pub struct ConversationAttachment {
     pub workspace_label: String,
     #[serde(default)]
     pub tab_label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_number: Option<usize>,
     pub workspace_location_id: String,
     pub tab_location_id: String,
     pub cwd: String,
@@ -72,6 +76,8 @@ pub struct ConversationRecord {
     pub session_ref: Option<AgentSessionRef>,
     pub title: String,
     pub saved_location: ConversationAttachment,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_terminal_ids: Vec<String>,
     pub disposition: Disposition,
     pub created_at_ms: u64,
     pub attention_returned_at_ms: u64,
@@ -115,6 +121,7 @@ pub struct ConversationObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationAction {
     Settle,
+    SettleAndClose,
     Reopen,
     BeginResume,
     ResumeLaunched(Box<ConversationAttachment>),
@@ -225,6 +232,13 @@ impl InboxRegistry {
             }
         }
         registry
+    }
+
+    pub fn retired_terminal_ids(&self) -> BTreeSet<String> {
+        self.records
+            .values()
+            .flat_map(|record| record.retired_terminal_ids.iter().cloned())
+            .collect()
     }
 
     pub fn revision(&self) -> u64 {
@@ -469,6 +483,11 @@ impl InboxRegistry {
         let current = self.records.get(id).ok_or(InboxError::NotFound)?;
         let satisfied = match &action {
             ConversationAction::Settle => current.disposition == Disposition::Settled,
+            ConversationAction::SettleAndClose => {
+                current.disposition == Disposition::Settled
+                    && current.execution == ExecutionState::Closed
+                    && current.attachments.is_empty()
+            }
             ConversationAction::Reopen => current.disposition == Disposition::Inbox,
             ConversationAction::BeginResume => current.resume_state == ResumeState::Pending,
             ConversationAction::ResumeLaunched(target) => {
@@ -497,7 +516,7 @@ impl InboxRegistry {
         let mut next = self.clone();
         let record = next.records.get_mut(id).expect("record checked");
         match action {
-            ConversationAction::Settle => {
+            ConversationAction::Settle | ConversationAction::SettleAndClose => {
                 if record.session_ref.is_none()
                     || !matches!(
                         record.execution,
@@ -511,6 +530,31 @@ impl InboxRegistry {
                         "conversation is running, blocked, unavailable, or lacks durable identity"
                             .into(),
                     ));
+                }
+                if action == ConversationAction::SettleAndClose {
+                    if record.attachments.len() > 1 {
+                        return Err(InboxError::Ineligible(
+                            "conversation has more than one attachment".into(),
+                        ));
+                    }
+                    if let Some(attachment) = record.attachments.first() {
+                        if attachment.terminal_id.is_empty() {
+                            return Err(InboxError::Ineligible(
+                                "conversation lacks terminal generation".into(),
+                            ));
+                        }
+                        if !record
+                            .retired_terminal_ids
+                            .contains(&attachment.terminal_id)
+                        {
+                            record
+                                .retired_terminal_ids
+                                .push(attachment.terminal_id.clone());
+                        }
+                        record.saved_location = attachment.clone();
+                    }
+                    record.attachments.clear();
+                    record.execution = ExecutionState::Closed;
                 }
                 record.disposition = Disposition::Settled;
                 record.settled_at_ms = Some(now_ms);
@@ -686,6 +730,7 @@ fn new_record(observation: &ConversationObservation, id: &str, now_ms: u64) -> C
         session_ref: authoritative_session(observation).cloned(),
         title: observation.title.clone(),
         saved_location: observation.attachment.clone(),
+        retired_terminal_ids: Vec::new(),
         disposition: Disposition::Inbox,
         created_at_ms: now_ms,
         attention_returned_at_ms: now_ms,
@@ -843,6 +888,54 @@ fn finish_commit_sync(result: std::io::Result<()>) -> Result<(), InboxError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn intentional_close_tombstones_survive_repeated_restore_and_saved_location_changes() {
+        let path = temp_path("retired-generations");
+        let mut registry = InboxRegistry::load(Some(path.clone()), "one".into());
+        for (index, generation) in ["first", "restored", "restored-again"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut observed = observation(Some("native"), 1, ExecutionState::Idle);
+            observed.generation = generation.into();
+            observed.attachment.terminal_id = generation.into();
+            let now = (index as u64 + 1) * 10;
+            registry.reconcile(&[observed], now).unwrap();
+            let record = sole(&registry);
+            registry
+                .mutate(
+                    &record.id,
+                    record.revision,
+                    ConversationAction::SettleAndClose,
+                    now + 1,
+                )
+                .unwrap();
+            registry = InboxRegistry::load(Some(path.clone()), format!("boot-{index}"));
+            assert_eq!(sole(&registry).saved_location.terminal_id, generation);
+        }
+        assert_eq!(
+            registry.retired_terminal_ids(),
+            ["first", "restored", "restored-again"]
+                .map(str::to_string)
+                .into()
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_nonclosing_settlement_does_not_retire_a_terminal_generation() {
+        let mut registry = registry();
+        registry
+            .reconcile(&[observation(Some("one"), 1, ExecutionState::Idle)], 10)
+            .unwrap();
+        let record = sole(&registry);
+        registry
+            .mutate(&record.id, record.revision, ConversationAction::Settle, 20)
+            .unwrap();
+        assert!(registry.retired_terminal_ids().is_empty());
+        assert_eq!(sole(&registry).attachments.len(), 1);
+    }
+
     fn observation(
         session: Option<&str>,
         pane_id: u32,
@@ -861,6 +954,8 @@ mod tests {
                 tab_id: "w1:t1".into(),
                 workspace_label: "Project".into(),
                 tab_label: "Main".into(),
+                pane_label: None,
+                pane_number: Some(1),
                 workspace_location_id: "stable-workspace".into(),
                 tab_location_id: "stable-tab".into(),
                 cwd: "/tmp".into(),

@@ -6,6 +6,7 @@ use crate::protocol::{
 };
 use crossterm::event::MouseEvent;
 mod agent_inbox;
+mod inbox_keys;
 mod text_editing;
 
 pub(super) fn snapshot() -> ClientShellSnapshot {

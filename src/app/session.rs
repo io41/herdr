@@ -107,6 +107,29 @@ impl App {
         self.session_save_deadline = None;
     }
 
+    pub(crate) fn checkpoint_session_before_conversation_close(&mut self) -> std::io::Result<()> {
+        if let Some(thread) = self.session_save_thread.take() {
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("session save thread panicked"))?;
+        }
+        if !self.policy.persist_session {
+            return Ok(());
+        }
+        let SessionSaveJob::Save { snapshot, history } = self.capture_session_save_job() else {
+            return Err(std::io::Error::other(
+                "conversation close has no session to checkpoint",
+            ));
+        };
+        self.session_writer
+            .lock()
+            .map_err(|_| std::io::Error::other("session writer is poisoned"))?
+            .save_checked(&snapshot, history.as_ref())?;
+        self.pane_exit_checkpoint_pending = false;
+        self.session_save_deadline = None;
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_session_before_pane_exit(&mut self) {
         if !self.policy.persist_session
             || (self.pane_exit_checkpoint_pending && !self.state.session_dirty)

@@ -23,8 +23,10 @@ pub(super) fn dispatch_client_shell_actions(
                     crate::api::schema::Method::AgentConversationList(_)
                         | crate::api::schema::Method::AgentConversationOpen(_)
                         | crate::api::schema::Method::AgentConversationSettle(_)
+                        | crate::api::schema::Method::AgentConversationSettleAndClose(_)
                         | crate::api::schema::Method::AgentConversationReopen(_)
                         | crate::api::schema::Method::AgentConversationResume(_)
+                        | crate::api::schema::Method::AgentConversationRestore(_)
                 );
                 if let Some(connection) = endpoints.connection(&endpoint_id).filter(|connection| {
                     conversation
@@ -905,7 +907,9 @@ mod tests {
             endpoint::ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
         );
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut endpoints = endpoint::EndpointRegistry::empty();
+        let local_sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut endpoints =
+            endpoint::EndpointRegistry::new(Capture(local_sent.clone()), 1, Default::default());
         endpoints.insert(
             remote.clone(),
             Capture(sent.clone()),
@@ -938,6 +942,34 @@ mod tests {
                     ),
                 }),
             },
+            shell::ClientShellAction::Endpoint {
+                endpoint_id: remote.clone(),
+                boot_id: "boot".into(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "settle-close".into(),
+                    method: crate::api::schema::Method::AgentConversationSettleAndClose(
+                        crate::api::schema::AgentConversationMutationParams {
+                            conversation_id: "conversation".into(),
+                            expected_revision: 4,
+                        },
+                    ),
+                }),
+            },
+            shell::ClientShellAction::Endpoint {
+                endpoint_id: remote.clone(),
+                boot_id: "boot".into(),
+                request: Box::new(crate::api::schema::Request {
+                    id: "restore".into(),
+                    method: crate::api::schema::Method::AgentConversationRestore(
+                        crate::api::schema::AgentConversationRestoreParams {
+                            conversation_id: "conversation".into(),
+                            expected_revision: 5,
+                            location: None,
+                            cwd: None,
+                        },
+                    ),
+                }),
+            },
         ];
         let mut scheduled = None;
         let (replay, repaint) = dispatch_client_shell_actions(
@@ -954,14 +986,64 @@ mod tests {
         assert!(scheduled.is_none());
         assert_eq!(endpoints.active_id(), &endpoint::ClientEndpointId::Local);
         assert!(!endpoints.connection(&remote).unwrap().surface_active);
-        let messages = sent.lock().unwrap();
-        let [ClientMessage::ClientShellEndpointRequest { boot_id, request }] = messages.as_slice()
-        else {
-            panic!("one metadata request");
-        };
-        assert_eq!(boot_id, "boot");
-        let request: crate::api::schema::Request = serde_json::from_str(request).unwrap();
-        assert_eq!(request.id, "next-page");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(!commands.accepts_response(
+            &endpoint::ClientEndpointId::Local,
+            2,
+            "boot",
+            "next-page"
+        ));
+        assert!(!commands.accepts_response(&remote, 1, "boot", "next-page"));
+        assert!(commands.accepts_response(&remote, 2, "boot", "next-page"));
+        assert!(commands
+            .receive_chunk(
+                &remote,
+                2,
+                "boot",
+                "next-page",
+                true,
+                br#"{"id":"next-page","error":{"code":"unavailable","message":"retry"}}"#.to_vec(),
+            )
+            .unwrap()
+            .is_some());
+        assert!(commands.send_next(&remote, &mut endpoints).is_empty());
+        let expired =
+            commands.expire(std::time::Instant::now() + std::time::Duration::from_secs(61));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].endpoint_id, remote);
+        assert_eq!(expired[0].request_id, "settle-close");
+        assert!(commands.send_next(&remote, &mut endpoints).is_empty());
+        let requests = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                let ClientMessage::ClientShellEndpointRequest { boot_id, request } = message else {
+                    panic!("only endpoint-qualified requests");
+                };
+                assert_eq!(boot_id, "boot");
+                serde_json::from_str::<crate::api::schema::Request>(request).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].id, "next-page");
+        assert!(matches!(
+            requests[0].method,
+            crate::api::schema::Method::AgentConversationList(_)
+        ));
+        assert_eq!(requests[1].id, "settle-close");
+        assert!(matches!(
+            requests[1].method,
+            crate::api::schema::Method::AgentConversationSettleAndClose(_)
+        ));
+        assert_eq!(requests[2].id, "restore");
+        assert!(matches!(
+            requests[2].method,
+            crate::api::schema::Method::AgentConversationRestore(_)
+        ));
+        assert!(local_sent.lock().unwrap().is_empty());
+        assert_eq!(endpoints.active_id(), &endpoint::ClientEndpointId::Local);
+        assert!(!endpoints.connection(&remote).unwrap().surface_active);
     }
 
     #[test]

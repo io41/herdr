@@ -959,7 +959,7 @@ fn active_agent_view_controls_sidebar_order_and_focus_indices() {
 }
 
 #[test]
-fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
+fn agent_view_selector_sort_is_client_local_and_persists_per_endpoint() {
     let path = std::env::temp_dir().join(format!(
         "herdr-shell-agent-sort-{}-{}.json",
         std::process::id(),
@@ -991,7 +991,8 @@ fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
     state.set_snapshot(Box::new(projected));
     state.set_pane_surface(surface());
     state.compose(106, 30).expect("agent sidebar frame");
-    let toggle = state.hits.agent_sort_toggle;
+    let toggle = state.hits.agent_inbox_toggle;
+    assert!(state.hits.agent_sort_toggle.is_empty());
 
     let click = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -1000,6 +1001,11 @@ fn agent_sort_toggle_is_client_local_and_persists_per_endpoint() {
         modifiers: KeyModifiers::empty(),
     })]);
 
+    assert!(matches!(
+        state.overlay,
+        Some(ClientShellOverlay::ContextMenu(_))
+    ));
+    state.handle_input_bytes(b"\x1b[B\r");
     assert_eq!(
         state.config.agent_panel_sort,
         crate::config::AgentPanelSortConfig::Priority

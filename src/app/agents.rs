@@ -162,6 +162,7 @@ impl App {
         }
         let persisted_agent_session =
             crate::agent_resume::persisted_session_from_launch_args(kind, &params.args);
+        let interactive_startup_only = params.args.is_empty() || persisted_agent_session.is_some();
         let conflicts = self.agent_name_conflicts(&name, "");
         if !conflicts.is_empty() {
             return Err(AgentStartError::DuplicateName {
@@ -219,7 +220,12 @@ impl App {
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let submitted = if interactive_startup_only {
+            runtime.try_send_system_bytes(Bytes::from(bytes))
+        } else {
+            runtime.try_send_bytes(Bytes::from(bytes))
+        };
+        if let Err(err) = submitted {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
         }

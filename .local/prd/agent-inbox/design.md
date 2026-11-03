@@ -78,3 +78,13 @@ Keep authoritative conversation records after pane closure. Save the owning endp
 Open inspects and never changes disposition. Reopen changes disposition without launching a process. Resume expresses explicit intent to reopen and continue the saved session. Reuse an existing attachment or reserve a single launch before creating a pane. Clear settlement after the provider reports the matching identity. A definitive failure preserves disposition. An uncertain outcome remains visible in Inbox and blocks duplicate launch until attachment reconciliation resolves it.
 
 If the saved destination no longer exists, require an explicit recreation or location choice. Validate the selected directory before starting a process. Do not recreate worktrees or substitute a new provider session. Provider capability gaps must remain visible in the client.
+
+## Revised explicit close and automatic placement
+
+The user revised settlement after live testing: UI Settle saves the exact native conversation, then closes its sole eligible agent and pane. New advertised `agent.conversation.settle_and_close` and `agent.conversation.restore` methods carry these semantics; published settle and resume methods retain their earlier behavior.
+
+Before close, serialize a checked session checkpoint with terminal-generation identity after joining any older save. Persist the retired generation with the settled conversation before stopping its runtime. Startup pruning happens before agent restoration and preserves the valid saved screen history of surviving panes.
+
+Restore prioritizes durable identity, then unique saved Space and displayed tab names as destination preferences. Names never identify a conversation. Reuse existing containers, create only missing containers, and focus the exact selected or newly launched pane. Missing directories and ambiguous destinations are exceptional recovery prompts rather than permanent menu options.
+
+Meaningful row titles and location breadcrumbs use existing metadata and saved context. One real view selector replaces the overdrawn legacy header. Action shortcuts are modal and do not intercept ordinary agent input.

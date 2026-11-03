@@ -229,6 +229,8 @@ impl HeadlessServer {
             method,
             Method::CommandInvoke(_)
                 | Method::PaneClose(_)
+                | Method::AgentConversationSettleAndClose(_)
+                | Method::AgentConversationRestore(_)
                 | Method::PaneEditScrollback(_)
                 | Method::PaneMove(_)
                 | Method::PaneSplit(_)
@@ -1013,32 +1015,44 @@ impl HeadlessServer {
 }
 
 impl HeadlessServer {
-    pub(super) fn handle_client_conversation_open_request(
+    pub(super) fn handle_client_conversation_request(
         &mut self,
         client_id: u64,
         mut message: api::ApiRequestMessage,
     ) -> bool {
-        let focus_before = self.shell_focus_target(client_id);
+        let focus_before = self.shell_focus_targets();
         let focused_tabs_before = self.focused_shell_tabs();
         let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
         let original = std::mem::replace(&mut message.respond_to, proxy_tx);
         let changed = self.handle_api_request_with_shutdown_check_inner(message, true, true);
-        let result = forward_proxied_api_response(Some((original, proxy_rx)));
-        if matches!(
-            result,
-            Some(api::schema::ResponseResult::AgentConversationOpened { .. })
-        ) {
+        let Ok(response) = proxy_rx.recv() else {
+            return changed;
+        };
+        let result = serde_json::from_str::<api::schema::SuccessResponse>(&response)
+            .ok()
+            .map(|response| response.result);
+        let focused_pane = match &result {
+            Some(api::schema::ResponseResult::AgentConversationOpened { pane_id, .. }) => {
+                Some(pane_id.as_str())
+            }
+            Some(api::schema::ResponseResult::AgentConversationResume { result }) => {
+                result.get("pane_id").and_then(serde_json::Value::as_str)
+            }
+            _ => None,
+        };
+        self.reconcile_client_shell_locations();
+        if focused_pane.is_some_and(|pane_id| {
+            self.app
+                .parse_pane_id(pane_id)
+                .is_some_and(|(workspace, pane)| {
+                    self.app.state.active == Some(workspace)
+                        && self.app.state.workspaces[workspace].focused_pane_id() == Some(pane)
+                })
+        }) {
             self.focus_shell_client_on_default_target(client_id);
-            let focus_after = self.shell_focus_target(client_id);
-            let focused_tabs_after = self.focused_shell_tabs();
-            self.app.accept_current_focus_without_events();
-            self.send_shell_navigation_focus_events(
-                focus_before.as_ref(),
-                focus_after.as_ref(),
-                &focused_tabs_before,
-                &focused_tabs_after,
-            );
         }
+        self.finish_shell_location_reconciliation(focus_before, &focused_tabs_before);
+        let _ = original.send(response);
         changed
     }
 }

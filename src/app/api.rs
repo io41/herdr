@@ -118,6 +118,11 @@ impl App {
             ev => ev,
         };
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
+            if let Some((ws_idx, _)) = self.find_pane(*pane_id) {
+                if let Some(runtime) = self.lookup_runtime_sender(ws_idx, *pane_id) {
+                    runtime.clear_human_submissions();
+                }
+            }
             if let Some(terminal_id) = self
                 .find_pane(*pane_id)
                 .map(|(_, pane)| pane.attached_terminal_id.to_string())
@@ -375,8 +380,32 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        let submission_observation = match &ev {
+            AppEvent::StateChanged {
+                pane_id,
+                observed_at,
+                ..
+            } => Some((*pane_id, *observed_at)),
+            AppEvent::HookStateReported {
+                pane_id,
+                observed_at,
+                ..
+            } => Some((*pane_id, *observed_at)),
+            _ => None,
+        };
         let previous_toast = self.state.toast.clone();
         let mut pane_updates = self.state.handle_app_event(ev);
+        for update in &pane_updates {
+            if let Some(runtime) = self.lookup_runtime_sender(update.ws_idx, update.pane_id) {
+                if update.agent_released {
+                    runtime.clear_human_submissions();
+                } else if let Some((pane_id, observed_at)) = submission_observation {
+                    if update.pane_id == pane_id && update.previous_state != update.state {
+                        runtime.observe_human_submission_state(update.state, observed_at);
+                    }
+                }
+            }
+        }
         if update_ready.is_some() {
             self.state.latest_release_notes = crate::release_notes::load_latest();
         }
@@ -1167,6 +1196,12 @@ impl App {
                     params,
                     crate::agent_inbox::ConversationAction::Settle,
                 )
+            }
+            Method::AgentConversationSettleAndClose(params) => {
+                return self.handle_agent_conversation_settle_and_close(request.id, params)
+            }
+            Method::AgentConversationRestore(params) => {
+                return self.handle_agent_conversation_restore(request.id, params)
             }
             Method::AgentConversationReopen(params) => {
                 return self.handle_agent_conversation_mutation(

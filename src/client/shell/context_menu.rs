@@ -9,6 +9,30 @@ impl ClientContextMenuOverlay {
             action,
         };
         match &self.target {
+            ClientContextMenuTarget::AgentViews { selected, expanded } => {
+                let mut items: Vec<_> = ["Inbox", "All agents by space", "All agents by attention"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| ClientContextMenuItem {
+                        label: format!("{} {label}", if index == *selected { "✓" } else { " " }),
+                        action: Action::AgentView(index),
+                    })
+                    .collect();
+                items.extend(["Inbox", "Working", "Settled"].into_iter().enumerate().map(
+                    |(index, label)| ClientContextMenuItem {
+                        label: format!(
+                            "{} {label} section",
+                            if expanded[index] {
+                                "Collapse"
+                            } else {
+                                "Expand"
+                            }
+                        ),
+                        action: Action::AgentSection(index),
+                    },
+                ));
+                items
+            }
             ClientContextMenuTarget::Conversation {
                 record,
                 available,
@@ -19,7 +43,7 @@ impl ClientContextMenuOverlay {
                 .iter()
                 .enumerate()
                 .map(|(index, (_, _, label))| ClientContextMenuItem {
-                    label: format!("Resume in {label}"),
+                    label: format!("Restore in {label}"),
                     action: Action::ConversationLocation(index),
                 })
                 .collect(),
@@ -208,7 +232,32 @@ impl ClientShellState {
             outcome.repaint = true;
             return;
         };
+        if action == ClientContextMenuAction::Disabled {
+            self.overlay = Some(ClientShellOverlay::ContextMenu(menu));
+            outcome.repaint = true;
+            return;
+        }
         match menu.target {
+            ClientContextMenuTarget::AgentViews { .. } => {
+                if let ClientContextMenuAction::AgentView(index) = action {
+                    self.agent_inbox = index == 0;
+                    if index != 0 {
+                        self.config.agent_panel_sort = if index == 1 {
+                            crate::config::AgentPanelSortConfig::Spaces
+                        } else {
+                            crate::config::AgentPanelSortConfig::Priority
+                        };
+                        self.agent_panel_sort_manual = true;
+                    }
+                    self.agent_scroll = 0;
+                    self.persist_chrome_preferences(outcome);
+                } else if let ClientContextMenuAction::AgentSection(index) = action {
+                    let old = self.visible_conversations();
+                    self.agent_inbox_expanded[index] = !self.agent_inbox_expanded[index];
+                    self.reconcile_conversation_selection(&old);
+                    self.persist_chrome_preferences(outcome);
+                }
+            }
             ClientContextMenuTarget::Conversation {
                 endpoint_id,
                 record,
@@ -222,7 +271,7 @@ impl ClientShellState {
             } => {
                 if let ClientContextMenuAction::ConversationLocation(index) = action {
                     if let Some((workspace_id, tab_id, _)) = locations.get(index) {
-                        self.push_conversation_method(endpoint_id, crate::api::schema::Method::AgentConversationResume(crate::api::schema::AgentConversationResumeParams { conversation_id: record.id, expected_revision: record.revision, location: Some(crate::api::schema::AgentConversationResumeLocation::Choose { workspace_id: workspace_id.clone(), tab_id: Some(tab_id.clone()), cwd: Some(cwd) }) }), outcome);
+                        self.push_conversation_method(endpoint_id, crate::api::schema::Method::AgentConversationRestore(crate::api::schema::AgentConversationRestoreParams { conversation_id: record.id, expected_revision: record.revision, cwd: None, location: Some(crate::api::schema::AgentConversationResumeLocation::Choose { workspace_id: workspace_id.clone(), tab_id: Some(tab_id.clone()), cwd: Some(cwd) }) }), outcome);
                     }
                 }
             }

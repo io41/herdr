@@ -17,6 +17,9 @@ pub(super) struct ConversationRow {
     pub(super) id: String,
     pub(super) label: String,
     pub(super) detail: String,
+    pub(super) status: String,
+    pub(super) provider: String,
+    pub(super) origin: Option<String>,
     pub(super) section: usize,
     pub(super) order: u64,
     pub(super) unavailable: bool,
@@ -41,7 +44,7 @@ pub(super) fn record_status(record: &ConversationRecord, unavailable: bool) -> &
     } else if record.failure {
         "Failed"
     } else if record.resume_state != ResumeState::None {
-        "Awaiting session confirmation"
+        "Confirm session"
     } else {
         match record.execution {
             ExecutionState::Working => "Working",
@@ -57,6 +60,108 @@ pub(super) fn record_status(record: &ConversationRecord, unavailable: bool) -> &
             ExecutionState::Closed => "Closed",
         }
     }
+}
+
+pub(super) fn conversation_title(record: &ConversationRecord) -> String {
+    if !record.title.trim().is_empty()
+        && !record
+            .title
+            .trim()
+            .eq_ignore_ascii_case("Agent conversation")
+    {
+        return record.title.clone();
+    }
+    let location = record.attachments.first().unwrap_or(&record.saved_location);
+    location
+        .pane_label
+        .clone()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| {
+            if !location.tab_label.trim().is_empty() && location.tab_label.parse::<usize>().is_err()
+            {
+                location.tab_label.clone()
+            } else {
+                format!(
+                    "{} / Pane {}",
+                    location_label(&location.workspace_label, &location.workspace_id),
+                    location.pane_number.unwrap_or(location.pane_id as usize)
+                )
+            }
+        })
+}
+
+pub(super) fn conversation_breadcrumb(record: &ConversationRecord) -> String {
+    let location = record.attachments.first().unwrap_or(&record.saved_location);
+    let pane = location
+        .pane_label
+        .clone()
+        .filter(|label| !label.trim().is_empty())
+        .or_else(|| location.pane_number.map(|number| format!("Pane {number}")))
+        .unwrap_or_else(|| format!("Pane {}", location.pane_id));
+    format!(
+        "{}{} / {} / {}",
+        if record.attachments.is_empty() {
+            "Last known: "
+        } else {
+            ""
+        },
+        location_label(&location.workspace_label, &location.workspace_id),
+        location_label(&location.tab_label, &location.tab_id),
+        pane
+    )
+}
+
+pub(super) fn row_headline(row: &ConversationRow, width: usize, unread: bool) -> String {
+    let status_width = usize::from(super::render::display_width(&row.status));
+    let title_width = width.saturating_sub(status_width + 3);
+    let title = crate::ui::truncate_end(
+        &format!("{}{}", if unread { "● " } else { "" }, row.label),
+        title_width,
+    );
+    if title_width == 0 {
+        row.status.clone()
+    } else {
+        format!("{title} · {}", row.status)
+    }
+}
+
+pub(super) fn row_detail(row: &ConversationRow, width: usize) -> String {
+    let location = row.detail.as_str();
+    let provider = row.provider.as_str();
+    let origin = row.origin.as_deref();
+    let full = format!(
+        "{provider} · {location}{}",
+        origin
+            .map(|origin| format!(" · {origin}"))
+            .unwrap_or_default()
+    );
+    if usize::from(super::render::display_width(&full)) <= width {
+        return full;
+    }
+    let (prefix, location) = location
+        .strip_prefix("Last known: ")
+        .map_or(("", location), |location| ("Last: ", location));
+    let parts: Vec<_> = location.split(" / ").collect();
+    let mut remaining = width.saturating_sub(
+        usize::from(super::render::display_width(provider))
+            + 3
+            + usize::from(super::render::display_width(prefix))
+            + parts.len().saturating_sub(1),
+    );
+    let compact = parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let text = crate::ui::truncate_end(
+                &part.replace("Pane ", "#"),
+                remaining / (parts.len() - index),
+            );
+            remaining = remaining.saturating_sub(usize::from(super::render::display_width(&text)));
+            text
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{provider} · {prefix}{compact}")
 }
 
 pub(super) fn conversation_rows(endpoints: &[ClientShellEndpoint]) -> Vec<ConversationRow> {
@@ -91,13 +196,11 @@ pub(super) fn conversation_rows(endpoints: &[ClientShellEndpoint]) -> Vec<Conver
                 rows.push(ConversationRow {
                     endpoint_id: endpoint.endpoint_id.clone(),
                     id: record.id.clone(),
-                    label: record.title.clone(),
-                    detail: format!(
-                        "{} · {} · {}",
-                        endpoint.label,
-                        record.provider,
-                        record_status(record, unavailable)
-                    ),
+                    label: conversation_title(record),
+                    detail: conversation_breadcrumb(record),
+                    status: record_status(record, unavailable).into(),
+                    provider: record.provider.clone(),
+                    origin: (endpoints.len() > 1).then(|| endpoint.label.clone()),
                     section,
                     order: match section {
                         1 => record.last_human_submission_at_ms.unwrap_or(0),
@@ -132,16 +235,48 @@ pub(super) fn conversation_rows(endpoints: &[ClientShellEndpoint]) -> Vec<Conver
                 .iter()
                 .filter(|agent| !represented.contains(agent.pane_id.as_str()))
             {
+                let workspace = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == agent.workspace_id);
+                let tab = snapshot.tabs.iter().find(|tab| tab.tab_id == agent.tab_id);
+                let pane = snapshot
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == agent.pane_id);
+                let title = agent
+                    .name
+                    .as_ref()
+                    .or(agent.title.as_ref())
+                    .filter(|title| {
+                        !title.trim().is_empty()
+                            && !title.trim().eq_ignore_ascii_case("Agent conversation")
+                    })
+                    .or_else(|| pane.and_then(|pane| pane.label.as_ref()))
+                    .cloned()
+                    .or_else(|| tab.map(|tab| tab.label.clone()))
+                    .or_else(|| agent.terminal_title_stripped.clone())
+                    .unwrap_or_else(|| agent.pane_id.clone());
+                let breadcrumb = format!(
+                    "{} / {} / {}",
+                    workspace.map_or(agent.workspace_id.as_str(), |workspace| workspace
+                        .label
+                        .as_str()),
+                    tab.map_or(agent.tab_id.as_str(), |tab| tab.label.as_str()),
+                    pane.and_then(|pane| pane.label.as_deref())
+                        .unwrap_or(agent.pane_id.as_str())
+                );
                 rows.push(ConversationRow {
                     endpoint_id: endpoint.endpoint_id.clone(),
                     id: format!("pane:{}", agent.pane_id),
-                    label: agent
-                        .title
+                    label: title,
+                    detail: breadcrumb,
+                    status: "Unavailable".into(),
+                    provider: agent
+                        .display_agent
                         .clone()
-                        .or_else(|| agent.name.clone())
-                        .or_else(|| agent.display_agent.clone())
-                        .unwrap_or_else(|| agent.pane_id.clone()),
-                    detail: format!("{} · lifecycle unavailable", endpoint.label),
+                        .unwrap_or_else(|| "agent".into()),
+                    origin: (endpoints.len() > 1).then(|| endpoint.label.clone()),
                     section: 0,
                     order: 0,
                     unavailable,
@@ -284,34 +419,38 @@ pub(super) fn render_conversation_panel(
     if body.is_empty() || collapsed {
         return;
     }
-    hits.agent_inbox_toggle = Rect::new(body.x, body.y.saturating_sub(2), 9.min(body.width), 1);
-    if !enabled {
-        super::render::put_text(
-            buffer,
-            hits.agent_inbox_toggle.x,
-            hits.agent_inbox_toggle.y,
-            hits.agent_inbox_toggle.width,
-            " agents ▸",
-            Style::default().fg(config.palette.overlay0),
-        );
-        return;
-    }
-    hits.agents.clear();
-    hits.endpoint_agents.clear();
-    hits.agent_sort_toggle = Rect::default();
-    hits.agent_scrollbar = Rect::default();
-    hits.agent_scroll_metrics = None;
     let palette = &config.palette;
     let header = Rect::new(body.x, body.y.saturating_sub(2), body.width, 1);
-    buffer.set_style(header, Style::default().bg(palette.panel_bg));
+    hits.agent_inbox_toggle = header;
+    hits.agent_sort_toggle = Rect::default();
+    for x in header.x..header.right() {
+        buffer[(x, header.y)]
+            .set_symbol(" ")
+            .set_style(Style::default().bg(palette.panel_bg));
+    }
+    let title = if enabled {
+        " Inbox ▾"
+    } else {
+        match config.agent_panel_sort {
+            crate::config::AgentPanelSortConfig::Spaces => " All agents by space ▾",
+            crate::config::AgentPanelSortConfig::Priority => " All agents by attention ▾",
+        }
+    };
     super::render::put_text(
         buffer,
         header.x,
         header.y,
         header.width,
-        " inbox ▾   flat",
+        title,
         Style::default().fg(palette.accent),
     );
+    if !enabled {
+        return;
+    }
+    hits.agents.clear();
+    hits.endpoint_agents.clear();
+    hits.agent_scrollbar = Rect::default();
+    hits.agent_scroll_metrics = None;
     for y in body.y..body.bottom() {
         for x in body.x..body.right() {
             buffer[(x, y)]
@@ -354,23 +493,18 @@ pub(super) fn render_conversation_panel(
             for row in rows.iter().filter(|row| row.section == section) {
                 lines.push((
                     None,
-                    format!(
-                        " {}{}",
-                        if row.attention
+                    row_headline(
+                        row,
+                        body.width as usize,
+                        row.attention
                             > read
                                 .get(&read_key(&row.endpoint_id, &row.id))
                                 .copied()
-                                .unwrap_or(0)
-                        {
-                            "● "
-                        } else {
-                            ""
-                        },
-                        row.label
+                                .unwrap_or(0),
                     ),
                     Some(row),
                 ));
-                lines.push((None, format!("   {}", row.detail), Some(row)));
+                lines.push((None, row_detail(row, body.width as usize), Some(row)));
             }
         }
     }
@@ -410,6 +544,59 @@ pub(super) fn render_conversation_panel(
 }
 
 impl ClientShellState {
+    pub(super) fn open_agent_view_selector(&mut self, outcome: &mut ClientShellInput) {
+        let selected = if self.agent_inbox {
+            0
+        } else if self.config.agent_panel_sort == crate::config::AgentPanelSortConfig::Spaces {
+            1
+        } else {
+            2
+        };
+        self.overlay = Some(ClientShellOverlay::ContextMenu(ClientContextMenuOverlay {
+            target: ClientContextMenuTarget::AgentViews {
+                selected,
+                expanded: self.agent_inbox_expanded,
+            },
+            x: self.hits.agent_body.x,
+            y: self.hits.agent_body.y.saturating_sub(2),
+            highlighted: selected,
+        }));
+        outcome.repaint = true;
+    }
+
+    pub(super) fn open_selected_conversation_actions(&mut self, outcome: &mut ClientShellInput) {
+        let focused = self
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == self.active_endpoint_id)
+            .and_then(|endpoint| {
+                let pane = endpoint.snapshot.as_deref()?.focused_pane_id.as_ref()?;
+                let record = endpoint
+                    .conversations
+                    .as_ref()?
+                    .projection
+                    .conversations
+                    .iter()
+                    .find(|record| {
+                        record
+                            .attachments
+                            .iter()
+                            .any(|attachment| &attachment.public_pane_id == pane)
+                            || record
+                                .resume_target
+                                .as_ref()
+                                .is_some_and(|target| &target.public_pane_id == pane)
+                    })?;
+                Some((endpoint.endpoint_id.clone(), record.id.clone()))
+            });
+        if let Some((endpoint_id, id)) = focused.or_else(|| self.agent_inbox_selected.clone()) {
+            self.open_conversation(endpoint_id, id, true, outcome);
+        } else {
+            self.set_endpoint_error("Focus or select a conversation to open its actions");
+            outcome.repaint = true;
+        }
+    }
+
     pub(super) fn handle_conversation_navigation(
         &mut self,
         action: crate::input::KeybindAction,
@@ -535,10 +722,7 @@ impl ClientShellState {
             return false;
         }
         if !details && super::contains(self.hits.agent_inbox_toggle, point) {
-            self.agent_inbox = !self.agent_inbox;
-            self.agent_scroll = 0;
-            self.persist_chrome_preferences(outcome);
-            outcome.repaint = true;
+            self.open_agent_view_selector(outcome);
             return true;
         }
         if !self.agent_inbox {
@@ -581,8 +765,7 @@ impl ClientShellState {
         outcome: &mut ClientShellInput,
     ) {
         use crate::api::schema::{
-            AgentConversationMutationParams, AgentConversationResumeLocation,
-            AgentConversationResumeParams, Method,
+            AgentConversationMutationParams, AgentConversationRestoreParams, Method,
         };
         let method = match action {
             ClientContextMenuAction::ConversationOpen(index) => {
@@ -608,20 +791,14 @@ impl ClientShellState {
                 })
             }
             ClientContextMenuAction::ConversationSettle => {
-                Method::AgentConversationSettle(AgentConversationMutationParams {
-                    conversation_id: record.id,
-                    expected_revision: record.revision,
-                })
-            }
-            ClientContextMenuAction::ConversationReopen => {
-                Method::AgentConversationReopen(AgentConversationMutationParams {
+                Method::AgentConversationSettleAndClose(AgentConversationMutationParams {
                     conversation_id: record.id,
                     expected_revision: record.revision,
                 })
             }
             ClientContextMenuAction::ConversationChooseLocation => {
                 self.overlay = Some(ClientShellOverlay::Rename(ClientRenameOverlay {
-                    title: "resume working directory",
+                    title: "restore working directory",
                     input: TextEditor::new(&record.saved_location.cwd, false),
                     target: ClientRenameTarget::ConversationCwd {
                         endpoint_id,
@@ -631,21 +808,12 @@ impl ClientShellState {
                 outcome.repaint = true;
                 return;
             }
-            ClientContextMenuAction::ConversationResume
-            | ClientContextMenuAction::ConversationRecreateTab
-            | ClientContextMenuAction::ConversationRecreateSpace => {
-                Method::AgentConversationResume(AgentConversationResumeParams {
+            ClientContextMenuAction::ConversationResume => {
+                Method::AgentConversationRestore(AgentConversationRestoreParams {
                     conversation_id: record.id,
                     expected_revision: record.revision,
-                    location: match action {
-                        ClientContextMenuAction::ConversationRecreateTab => {
-                            Some(AgentConversationResumeLocation::RecreateTab)
-                        }
-                        ClientContextMenuAction::ConversationRecreateSpace => {
-                            Some(AgentConversationResumeLocation::RecreateSpace)
-                        }
-                        _ => None,
-                    },
+                    cwd: None,
+                    location: None,
                 })
             }
             _ => return,
@@ -654,6 +822,32 @@ impl ClientShellState {
     }
 
     pub(super) fn choose_conversation_location(
+        &mut self,
+        endpoint_id: ClientEndpointId,
+        record: Box<ConversationRecord>,
+        cwd: String,
+        outcome: &mut ClientShellInput,
+    ) {
+        if cwd.is_empty() {
+            self.set_endpoint_error("Enter a working directory to restore this conversation");
+            outcome.repaint = true;
+            return;
+        }
+        self.push_conversation_method(
+            endpoint_id,
+            crate::api::schema::Method::AgentConversationRestore(
+                crate::api::schema::AgentConversationRestoreParams {
+                    conversation_id: record.id,
+                    expected_revision: record.revision,
+                    location: None,
+                    cwd: Some(cwd),
+                },
+            ),
+            outcome,
+        );
+    }
+
+    fn show_conversation_locations(
         &mut self,
         endpoint_id: ClientEndpointId,
         record: Box<ConversationRecord>,
@@ -845,16 +1039,46 @@ impl ClientShellState {
                     self.push_endpoint_notice(
                         ClientEndpointNoticeKind::Rejected,
                         "conversation_resume_result",
-                        "Conversation resume",
+                        "Restore conversation",
                         message,
                     );
+                }
+                if result
+                    .get("pane_id")
+                    .and_then(|value| value.as_str())
+                    .is_some()
+                    && self.active_endpoint_id != endpoint_id
+                {
+                    return (
+                        true,
+                        vec![ClientShellAction::ActivateEndpoint {
+                            endpoint_id,
+                            target: None,
+                        }],
+                    );
+                }
+                if result.get("status").and_then(|value| value.as_str()) == Some("cwd_required") {
+                    if let Some(record) = record.clone() {
+                        let mut outcome = ClientShellInput::default();
+                        self.activate_conversation_action(
+                            endpoint_id.clone(),
+                            record,
+                            ClientContextMenuAction::ConversationChooseLocation,
+                            &mut outcome,
+                        );
+                    }
                 }
                 if result.get("status").and_then(|value| value.as_str())
                     == Some("location_required")
                 {
                     if let Some(record) = record {
                         let mut outcome = ClientShellInput::default();
-                        self.open_conversation(endpoint_id, record.id, true, &mut outcome);
+                        self.show_conversation_locations(
+                            endpoint_id,
+                            Box::new(record.clone()),
+                            record.saved_location.cwd,
+                            &mut outcome,
+                        );
                     }
                 }
             }
@@ -879,88 +1103,106 @@ pub(super) fn conversation_menu_items(
 ) -> Vec<ClientContextMenuItem> {
     use ClientContextMenuAction as Action;
     let mut items = Vec::new();
-    if available {
-        for (index, attachment) in
-            record
-                .attachments
-                .iter()
-                .enumerate()
-                .filter(|(_, attachment)| {
-                    methods.contains("agent.conversation.open")
-                        && !attachment.terminal_id.is_empty()
-                })
-        {
-            items.push(ClientContextMenuItem {
-                label: format!(
-                    "Open {} / {} / {}",
-                    location_label(&attachment.workspace_label, &attachment.workspace_id),
+    for (index, attachment) in record
+        .attachments
+        .iter()
+        .enumerate()
+        .filter(|(_, attachment)| !attachment.terminal_id.is_empty())
+    {
+        items.push(ClientContextMenuItem {
+            label: if record.attachments.len() == 1 {
+                "Open  Enter".into()
+            } else {
+                format!(
+                    "Open {} / {}",
                     location_label(&attachment.tab_label, &attachment.tab_id),
-                    attachment.public_pane_id
-                ),
-                action: Action::ConversationOpen(index),
-            });
-        }
-        if methods.contains("agent.conversation.open")
-            && record.resume_state != ResumeState::None
-            && record
-                .resume_target
-                .as_ref()
-                .is_some_and(|target| !target.terminal_id.is_empty())
-        {
-            items.push(ClientContextMenuItem {
-                label: "Open resumed session".into(),
-                action: Action::ConversationOpenResumeTarget,
-            });
-        }
-        if methods.contains("agent.conversation.reopen")
-            && record.session_ref.is_some()
-            && record.disposition == Disposition::Settled
-        {
-            items.push(ClientContextMenuItem {
-                label: "Reopen".into(),
-                action: Action::ConversationReopen,
-            });
-        }
-        if methods.contains("agent.conversation.settle")
-            && record.session_ref.is_some()
-            && record.disposition != Disposition::Settled
-            && record.resume_state == ResumeState::None
-            && !matches!(
-                record.execution,
-                ExecutionState::Working | ExecutionState::Unknown
-            )
-            && !record.queued_human_work
-            && !record.blocking_request
-        {
-            items.push(ClientContextMenuItem {
-                label: "Settle".into(),
-                action: Action::ConversationSettle,
-            });
-        }
-        if methods.contains("agent.conversation.resume")
-            && record.attachments.is_empty()
-            && record.session_ref.is_some()
-            && record.resume_state == ResumeState::None
-        {
-            items.extend([
-                ClientContextMenuItem {
-                    label: "Resume native conversation".into(),
-                    action: Action::ConversationResume,
-                },
-                ClientContextMenuItem {
-                    label: "Recreate original tab and resume".into(),
-                    action: Action::ConversationRecreateTab,
-                },
-                ClientContextMenuItem {
-                    label: "Recreate original Space and resume".into(),
-                    action: Action::ConversationRecreateSpace,
-                },
-                ClientContextMenuItem {
-                    label: "Choose location...".into(),
-                    action: Action::ConversationChooseLocation,
-                },
-            ]);
-        }
+                    attachment.pane_label.clone().unwrap_or_else(|| format!(
+                        "Pane {}",
+                        attachment
+                            .pane_number
+                            .unwrap_or(attachment.pane_id as usize)
+                    ))
+                )
+            },
+            action: if available && methods.contains("agent.conversation.open") {
+                Action::ConversationOpen(index)
+            } else {
+                Action::Disabled
+            },
+        });
+    }
+    if record.resume_state != ResumeState::None
+        && record
+            .resume_target
+            .as_ref()
+            .is_some_and(|target| !target.terminal_id.is_empty())
+    {
+        items.push(ClientContextMenuItem {
+            label: "Open restored session".into(),
+            action: if available {
+                Action::ConversationOpenResumeTarget
+            } else {
+                Action::Disabled
+            },
+        });
+    }
+    if record.disposition == Disposition::Settled || record.attachments.is_empty() {
+        let reason = if !available {
+            Some("endpoint unavailable")
+        } else if !methods.contains("agent.conversation.restore") {
+            Some("update endpoint")
+        } else if record.session_ref.is_none() {
+            Some("session identity unavailable")
+        } else if record.resume_state != ResumeState::None {
+            Some("awaiting session confirmation")
+        } else {
+            None
+        };
+        items.push(ClientContextMenuItem {
+            label: match reason {
+                Some(reason) => format!("Restore  r · {reason}"),
+                None => "Restore  r".into(),
+            },
+            action: if reason.is_none() {
+                Action::ConversationResume
+            } else {
+                Action::Disabled
+            },
+        });
+    } else {
+        let reason = if !available {
+            Some("endpoint unavailable")
+        } else if !methods.contains("agent.conversation.settle_and_close") {
+            Some("update endpoint")
+        } else if record.session_ref.is_none() {
+            Some("session identity unavailable")
+        } else if record.resume_state != ResumeState::None {
+            Some("awaiting session confirmation")
+        } else if record.execution == ExecutionState::Working || record.queued_human_work {
+            Some("working")
+        } else if record.blocking_request {
+            Some("needs input")
+        } else if record.failure {
+            Some("resolve failure first")
+        } else if !matches!(
+            record.execution,
+            ExecutionState::Idle | ExecutionState::Closed
+        ) {
+            Some("state unknown")
+        } else {
+            None
+        };
+        items.push(ClientContextMenuItem {
+            label: match reason {
+                Some(reason) => format!("Settle  s · {reason}"),
+                None => "Settle  s".into(),
+            },
+            action: if reason.is_none() {
+                Action::ConversationSettle
+            } else {
+                Action::Disabled
+            },
+        });
     }
     items
 }
@@ -971,43 +1213,16 @@ pub(super) fn conversation_details(target: &ClientContextMenuTarget) -> Vec<Stri
             record, available, ..
         } => {
             let mut lines = vec![
-                record.title.clone(),
+                conversation_title(record),
                 format!(
-                    "{} · {} · {:?}",
-                    record.provider,
+                    "{} · {}",
                     record_status(record, !available),
-                    record.disposition
+                    record.provider
                 ),
-                format!(
-                    "Saved location: {} / {}",
-                    location_label(
-                        &record.saved_location.workspace_label,
-                        &record.saved_location.workspace_id
-                    ),
-                    location_label(
-                        &record.saved_location.tab_label,
-                        &record.saved_location.tab_id
-                    )
-                ),
-                format!("Directory: {}", record.saved_location.cwd),
+                conversation_breadcrumb(record),
             ];
-            if record.resume_state != ResumeState::None {
-                lines.push(
-                    "Awaiting session confirmation. Open the resumed session to continue. Resume retry stays disabled until its identity is confirmed."
-                        .into(),
-                );
-            }
             if let Some(error) = &record.resume_error {
                 lines.push(error.clone());
-            }
-            lines.extend(record.capability_limits.iter().cloned());
-            if !available {
-                lines.push("Reconnect this endpoint to enable conversation actions.".into());
-            }
-            if record.session_ref.is_none() {
-                lines.push(
-                    "Native conversation identity is unavailable. Resume is disabled.".into(),
-                );
             }
             lines
         }

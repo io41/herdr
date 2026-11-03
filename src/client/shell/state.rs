@@ -526,14 +526,14 @@ pub(super) struct ClientWorktreeRemoveOverlay {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ClientContextMenuAction {
+    Disabled,
+    AgentView(usize),
+    AgentSection(usize),
     ConversationOpen(usize),
     ConversationOpenResumeTarget,
     ConversationLocation(usize),
     ConversationSettle,
-    ConversationReopen,
     ConversationResume,
-    ConversationRecreateTab,
-    ConversationRecreateSpace,
     ConversationChooseLocation,
     Rename,
     Close,
@@ -554,6 +554,10 @@ pub(super) enum ClientContextMenuAction {
 
 #[derive(Debug)]
 pub(super) enum ClientContextMenuTarget {
+    AgentViews {
+        selected: usize,
+        expanded: [bool; 3],
+    },
     ConversationLocations {
         endpoint_id: ClientEndpointId,
         record: Box<crate::agent_inbox::ConversationRecord>,

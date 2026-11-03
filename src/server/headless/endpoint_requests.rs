@@ -70,6 +70,8 @@ impl HeadlessServer {
             api::schema::Method::AgentConversationOpen(_)
                 | api::schema::Method::AgentConversationList(_)
                 | api::schema::Method::AgentConversationSettle(_)
+                | api::schema::Method::AgentConversationSettleAndClose(_)
+                | api::schema::Method::AgentConversationRestore(_)
                 | api::schema::Method::AgentConversationReopen(_)
                 | api::schema::Method::AgentConversationResume(_)
         );
@@ -135,8 +137,10 @@ impl HeadlessServer {
         if matches!(
             &message.request.method,
             api::schema::Method::AgentConversationOpen(_)
+                | api::schema::Method::AgentConversationRestore(_)
+                | api::schema::Method::AgentConversationSettleAndClose(_)
         ) {
-            return self.handle_client_conversation_open_request(client_id, message);
+            return self.handle_client_conversation_request(client_id, message);
         }
         if conversation_method {
             return self.handle_api_request_with_shutdown_check_inner(message, true, true);

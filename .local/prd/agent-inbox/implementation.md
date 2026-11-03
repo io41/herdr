@@ -19,7 +19,7 @@ Deliver the first release before adding timed Snooze, pins, and Undo. Each work 
 | --- | --- |
 | Prompt, run, complete | Working starts collapsed. Completion returns to Inbox after grace, including while its pane is visible. |
 | Completion, then view | Unread clears; Inbox membership remains. |
-| View, Settle, browse, Reopen | Settle moves the conversation to Settled without closing its pane. Browsing keeps it settled. Reopen returns it. |
+| View, Settle, browse, Reopen | Settle durably saves and closes the sole eligible agent/pane. Browsing keeps it settled. Restore reuses or creates the required location and focuses the restored pane. |
 | Running turn, queued human work, or blocking request | Settle is rejected without partial mutation or process interruption. |
 | Approval or question while execution remains active | Return immediately to Inbox, or stay visibly Pinned if pinned. Bypass Working and completion grace. |
 | Continuation within grace | Remain in Working and suppress the pending completion notification. |
@@ -33,7 +33,7 @@ Deliver the first release before adding timed Snooze, pins, and Undo. Each work 
 | Restore existing snapshot | Do not replay old completion alerts. |
 | Older endpoint or mixed endpoint versions | Disable unsupported actions locally while retaining usable compatible connections. |
 | Close pane, restart, Resume | Retain the conversation and resume its exact provider session in the saved location. |
-| Original tab, Space, or directory removed | Require explicit recreation or a valid location choice. Never silently use the current tab or create a worktree. |
+| Original tab, Space, or directory removed | Reuse uniquely matching existing names, create only missing containers, and prompt only for a missing directory or ambiguous destination. Never silently use an unrelated tab or create a worktree. |
 | Resume timeout after process launch | Show Status unknown in Inbox and reconcile attachments before retry. Never launch a duplicate automatically. |
 | Closed conversation with pending attention | Keep it in Inbox marked Closed; closure never settles it. |
 | Browse settled closed conversation | Show saved details without starting an agent or changing disposition. |
@@ -53,3 +53,11 @@ Deliver the first release before adding timed Snooze, pins, and Undo. Each work 
 - In an authorized Herdr pane, run the real Codex walkthrough in an isolated named test session. Do not control an existing user session from outside Herdr. A passing simulation or build alone does not prove provider signals or UI behavior.
 
 Implementation requires the checks above in addition to whitespace, relative-link, and source-reference checks. Record runtime limitations and acceptance results separately; a build alone does not establish acceptance.
+
+## Additional revised UX acceptance
+
+- Generic titles fall back to meaningful tab, Space, and pane context. Duplicate tab titles remain distinguishable and closed records show last-known location.
+- The header contains one working view selector with no leftover flat/grouped text. Keyboard-only entry and modal Settle/Restore shortcuts are covered; unprefixed typing remains terminal input.
+- Settle refuses queued/unconfirmed input, active work, unresolved requests, ambiguous attachments, and failed persistence without killing a process.
+- Crash-before-debounce recovery prunes exact retired generations before spawning agents, keeps replacements and legacy nonclosing settlement, and preserves valid surviving screen history.
+- Restore reuses existing Space/tab names when old durable IDs are unavailable, creates only missing containers, and focuses the exact restored pane before success is reported to the requesting client.

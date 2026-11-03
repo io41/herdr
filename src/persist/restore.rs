@@ -1553,6 +1553,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            terminal_id: None,
                             cwd,
                             label: Some("reviewer".into()),
                             agent_name: Some("reviewer".into()),
@@ -1642,6 +1643,7 @@ mod tests {
                         (
                             10,
                             super::super::snapshot::PaneSnapshot {
+                                terminal_id: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -1654,6 +1656,7 @@ mod tests {
                         (
                             20,
                             super::super::snapshot::PaneSnapshot {
+                                terminal_id: None,
                                 cwd: cwd.clone(),
                                 label: None,
                                 agent_name: None,
@@ -1708,6 +1711,7 @@ mod tests {
             (
                 id.parse::<u32>().unwrap(),
                 super::super::snapshot::PaneSnapshot {
+                    terminal_id: None,
                     cwd: cwd.clone(),
                     label: None,
                     agent_name: None,
@@ -1719,6 +1723,7 @@ mod tests {
             )
         };
         let final_pane = super::super::snapshot::PaneSnapshot {
+            terminal_id: None,
             cwd: cwd.clone(),
             label: Some("planner".into()),
             agent_name: Some("planner".into()),
@@ -1877,6 +1882,7 @@ mod tests {
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            terminal_id: None,
                             cwd,
                             label: None,
                             agent_name: None,
@@ -2188,6 +2194,7 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                terminal_id: None,
                 cwd: cwd.clone(),
                 label: None,
                 agent_name: None,

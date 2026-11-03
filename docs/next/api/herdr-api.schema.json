@@ -1285,6 +1285,39 @@
           ],
           "type": "object"
         },
+        "AgentConversationRestoreParams": {
+          "properties": {
+            "conversation_id": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expected_revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "location": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentConversationResumeLocation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "conversation_id",
+            "expected_revision"
+          ],
+          "type": "object"
+        },
         "AgentConversationResumeLocation": {
           "oneOf": [
             {
@@ -5437,6 +5470,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentConversationMutationParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.settle_and_close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationMutationParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.conversation.restore",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentConversationRestoreParams"
             }
           },
           "required": [

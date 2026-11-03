@@ -15,7 +15,7 @@ const AGENT_PROMPT_SUBMIT_DELAY: Duration = Duration::from_millis(300);
 type SubmittedAgentPrompt = (
     String,
     crate::api::schema::AgentInfo,
-    std::sync::mpsc::Receiver<std::io::Result<()>>,
+    crate::terminal::UserInputCompletion,
     Option<String>,
 );
 
@@ -505,6 +505,45 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app
+    }
+
+    #[tokio::test]
+    async fn interactive_agent_startup_does_not_reserve_a_human_turn() {
+        for (args, human_work) in [
+            (Vec::new(), false),
+            (vec!["resume".into(), "saved-session".into()], false),
+            (vec!["implement the requested task".into()], true),
+        ] {
+            let mut app = app_with_agent();
+            let pane = app.state.workspaces[0].tabs[0].root_pane;
+            let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+            let (runtime, mut input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+            let response = app.handle_agent_start(
+                "startup".into(),
+                AgentStartParams {
+                    name: "worker".into(),
+                    kind: "codex".into(),
+                    pane_id: app.pane_info(0, pane).unwrap().pane_id,
+                    args,
+                    timeout_ms: Some(30_000),
+                },
+            );
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["result"]["type"], "agent_started");
+            assert!(input.try_recv().unwrap().ends_with(b"\r"));
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            assert!(terminal.managed_agent_launch_pending());
+            terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+            assert!(terminal.reconcile_managed_agent_at(
+                std::time::Instant::now() + crate::app::agents::AGENT_START_SETTLE_DELAY,
+                false,
+            ));
+            assert!(!terminal.managed_agent_launch_pending());
+            let runtime = app.terminal_runtimes.get(&terminal_id).unwrap();
+            runtime.observe_human_submission_state(AgentState::Idle, std::time::Instant::now());
+            assert_eq!(runtime.has_pending_human_submission(), human_work);
+        }
     }
 
     fn start_deferred_agent_prompt(

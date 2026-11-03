@@ -257,6 +257,14 @@ mod tests {
 
         for (method, digest) in [
             (
+                "agent.conversation.settle_and_close",
+                "1c813656c38ff6e624f6a708a545846017d81d15fceb9bb04e1aad990ff079a0",
+            ),
+            (
+                "agent.conversation.restore",
+                "ed894818f47a1fe9061209dc46830daa28f2413591739e8638ffbfce58486650",
+            ),
+            (
                 "agent.conversation.open",
                 "4a66c0fd7187e43ddc5c253f8b00fcfce2a48f822a764d3bec1b8c54e449c058",
             ),

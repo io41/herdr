@@ -39,6 +39,99 @@ fn original_destination(
     matches.next().is_none().then_some(destination)
 }
 
+fn resolve_restore_destination(
+    workspaces: &[Workspace],
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+    saved: &crate::agent_inbox::ConversationAttachment,
+) -> Result<ResumeDestination, String> {
+    if !saved.workspace_location_id.is_empty()
+        && workspaces
+            .iter()
+            .filter(|ws| ws.location_id == saved.workspace_location_id)
+            .count()
+            > 1
+    {
+        return Err("The saved Space identity is ambiguous. Choose a location.".into());
+    }
+    let durable_tabs: Vec<_> = workspaces
+        .iter()
+        .enumerate()
+        .flat_map(|(workspace, ws)| {
+            ws.tabs
+                .iter()
+                .enumerate()
+                .filter_map(move |(tab, candidate)| {
+                    (!saved.tab_location_id.is_empty()
+                        && candidate.location_id == saved.tab_location_id)
+                        .then_some(ResumeDestination::Tab { workspace, tab })
+                })
+        })
+        .collect();
+    if durable_tabs.len() > 1 {
+        return Err("The saved tab identity is ambiguous. Choose a location.".into());
+    }
+    if let Some(destination) = durable_tabs.first() {
+        return Ok(*destination);
+    }
+    let durable_spaces: Vec<_> = workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, ws)| {
+            !saved.workspace_location_id.is_empty() && ws.location_id == saved.workspace_location_id
+        })
+        .map(|(workspace, _)| workspace)
+        .collect();
+    if durable_spaces.len() > 1 {
+        return Err("The saved Space identity is ambiguous. Choose a location.".into());
+    }
+    let workspace = if let Some(workspace) = durable_spaces.first() {
+        Some(*workspace)
+    } else {
+        if saved.workspace_label.trim().is_empty() {
+            return Err("The saved Space has no recoverable name. Choose a location.".into());
+        }
+        // Stable migrations can replace durable IDs. Human names are a fallback only when unique.
+        let named: Vec<_> = workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, ws)| ws.display_name_from_terminals(terminals) == saved.workspace_label)
+            .map(|(workspace, _)| workspace)
+            .collect();
+        match named.as_slice() {
+            [] => None,
+            [workspace] => Some(*workspace),
+            _ => return Err("Several Spaces have the saved name. Choose a location.".into()),
+        }
+    };
+    let Some(workspace) = workspace else {
+        return Ok(ResumeDestination::NewSpace);
+    };
+    if saved.tab_label.trim().is_empty() {
+        return Err("The saved tab has no recoverable name. Choose a location.".into());
+    }
+    let named: Vec<_> = workspaces[workspace]
+        .tabs
+        .iter()
+        .enumerate()
+        .filter(|(tab, _)| {
+            workspaces[workspace].tab_display_name(*tab).as_deref()
+                == Some(saved.tab_label.as_str())
+        })
+        .map(|(tab, _)| tab)
+        .collect();
+    match named.as_slice() {
+        [] => Ok(ResumeDestination::NewTab { workspace }),
+        [tab] => Ok(ResumeDestination::Tab {
+            workspace,
+            tab: *tab,
+        }),
+        _ => Err("Several tabs in the saved Space have the saved name. Choose a location.".into()),
+    }
+}
+
 fn validated_resume_cwd(cwd: &str) -> Result<PathBuf, String> {
     let path = Path::new(cwd);
     if !path.is_absolute() || !path.is_dir() {
@@ -115,6 +208,7 @@ impl super::App {
         destination: ResumeDestination,
         cwd: PathBuf,
         plan: &crate::agent_resume::AgentResumePlan,
+        focus: bool,
     ) -> std::io::Result<(usize, usize, crate::layout::PaneId)> {
         let (rows, cols) = self.state.new_pane_size(crate::ui::NewPanePlacement::Alone);
         let scrollback = self.state.pane_scrollback_limit_bytes;
@@ -198,6 +292,11 @@ impl super::App {
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        if focus {
+            self.state.focus_pane_in_workspace(workspace, pane_id);
+            self.state.mark_active_tab_seen();
+            self.state.mode = crate::app::Mode::Terminal;
+        }
         self.schedule_session_save();
         match destination {
             ResumeDestination::Tab { .. } => {
@@ -272,6 +371,13 @@ impl super::App {
                                     &workspace.id,
                                     tab.number,
                                 ),
+                                pane_label: terminal.manual_label.clone(),
+                                pane_number: tab
+                                    .layout
+                                    .pane_ids()
+                                    .iter()
+                                    .position(|id| id == pane_id)
+                                    .map(|index| index + 1),
                                 workspace_location_id: workspace.location_id.clone(),
                                 tab_location_id: tab.location_id.clone(),
                                 cwd: terminal.cwd.to_string_lossy().into_owned(),
@@ -351,10 +457,70 @@ impl super::App {
         changed
     }
 
+    pub(super) fn handle_agent_conversation_restore(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentConversationRestoreParams,
+    ) -> String {
+        self.handle_agent_conversation_resume_inner(
+            id,
+            crate::api::schema::AgentConversationResumeParams {
+                conversation_id: params.conversation_id,
+                expected_revision: params.expected_revision,
+                location: params.location,
+            },
+            true,
+            params.cwd,
+        )
+    }
+
+    fn focus_conversation_attachment(
+        &mut self,
+        attachment: &crate::agent_inbox::ConversationAttachment,
+    ) -> Option<String> {
+        if attachment.terminal_id.is_empty() {
+            return None;
+        }
+        let terminals = &self.state.terminals;
+        let matches: Vec<_> = self
+            .state
+            .workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(workspace, ws)| {
+                ws.tabs.iter().flat_map(move |tab| {
+                    tab.panes.iter().filter_map(move |(pane_id, pane)| {
+                        (pane.attached_terminal_id.as_str() == attachment.terminal_id
+                            && terminals.contains_key(&pane.attached_terminal_id))
+                        .then_some((workspace, *pane_id))
+                    })
+                })
+            })
+            .collect();
+        let [(workspace, pane_id)] = matches.as_slice() else {
+            return None;
+        };
+        let public = self.public_pane_id(*workspace, *pane_id)?;
+        self.state.focus_pane_in_workspace(*workspace, *pane_id);
+        self.state.mark_active_tab_seen();
+        self.state.mode = crate::app::Mode::Terminal;
+        Some(public)
+    }
+
     pub(super) fn handle_agent_conversation_resume(
         &mut self,
         id: String,
         params: crate::api::schema::AgentConversationResumeParams,
+    ) -> String {
+        self.handle_agent_conversation_resume_inner(id, params, false, None)
+    }
+
+    fn handle_agent_conversation_resume_inner(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentConversationResumeParams,
+        restore: bool,
+        cwd_override: Option<String>,
     ) -> String {
         use super::api::responses::encode_error;
         use crate::agent_inbox::{ConversationAction, ResumeState};
@@ -362,6 +528,90 @@ impl super::App {
         let Some(record) = self.agent_inbox.get(&params.conversation_id).cloned() else {
             return encode_error(id, "conversation_not_found", "Conversation not found.");
         };
+        if restore {
+            if record.resume_state != ResumeState::None {
+                let pane_id = record.resume_target.as_ref().and_then(|target| {
+                    let identity_changed = self
+                        .parse_pane_id(&target.public_pane_id)
+                        .and_then(|(workspace, pane)| self.agent_info(workspace, pane))
+                        .and_then(|info| info.agent_session)
+                        .is_some_and(|session| {
+                            session.source != record.source
+                                || session.agent != record.provider
+                                || record.session_ref.as_ref().is_none_or(|saved| {
+                                    saved.kind != session.kind || saved.value != session.value
+                                })
+                        });
+                    (!identity_changed)
+                        .then(|| self.focus_conversation_attachment(target))
+                        .flatten()
+                });
+                return restore_response(id, if record.resume_state == ResumeState::Pending { "pending" } else { "uncertain" }, &record,
+                    Some("Awaiting native session confirmation. Continue in the reserved terminal; no additional process was started."), pane_id);
+            }
+            if record.revision != params.expected_revision {
+                return encode_error(
+                    id,
+                    "conversation_revision_conflict",
+                    "Conversation changed. Refresh before restoring it.",
+                );
+            }
+            let mut attachments = self.verified_resume_attachments(&record);
+            for attachment in &record.attachments {
+                let same_session = self
+                    .parse_pane_id(&attachment.public_pane_id)
+                    .and_then(|(workspace, pane_id)| self.agent_info(workspace, pane_id))
+                    .is_some_and(|info| {
+                        info.terminal_id == attachment.terminal_id
+                            && info.agent_session.as_ref().is_some_and(|session| {
+                                session.source == record.source
+                                    && session.agent == record.provider
+                                    && record.session_ref.as_ref().is_some_and(|saved| {
+                                        saved.kind == session.kind && saved.value == session.value
+                                    })
+                            })
+                    });
+                if same_session
+                    && !attachments
+                        .iter()
+                        .any(|current| current.terminal_id == attachment.terminal_id)
+                {
+                    attachments.push(attachment.clone());
+                }
+            }
+            if attachments.len() > 1 || record.attachments.len() > 1 {
+                return encode_error(id, "conversation_attachment_required", "This conversation has multiple live attachments. Choose the attachment to open.");
+            }
+            if let Some(attachment) = attachments.first() {
+                let running = self
+                    .terminal_runtimes
+                    .iter()
+                    .any(|(terminal, _)| terminal.as_str() == attachment.terminal_id);
+                if !running {
+                    let pane_id = self.focus_conversation_attachment(attachment);
+                    return restore_response(id, "uncertain", &record,
+                        Some("The existing terminal has no confirmed running native session. No additional process was started."), pane_id);
+                }
+                return match self.agent_inbox.mutate(
+                    &record.id,
+                    params.expected_revision,
+                    ConversationAction::ResumeSucceeded,
+                    super::inbox::now_ms(),
+                ) {
+                    Ok(record) => match self.focus_conversation_attachment(attachment) {
+                        Some(pane_id) => {
+                            restore_response(id, "confirmed", &record, None, Some(pane_id))
+                        }
+                        None => encode_error(
+                            id,
+                            "conversation_attachment_unavailable",
+                            "The exact saved terminal is no longer available.",
+                        ),
+                    },
+                    Err(error) => encode_error(id, "conversation_resume_failed", error.to_string()),
+                };
+            }
+        }
         if record.resume_state != ResumeState::None {
             let status = if record.resume_state == ResumeState::Pending {
                 "pending"
@@ -410,22 +660,43 @@ impl super::App {
                 Some("This provider does not support exact session resume."),
             );
         };
-        let cwd = match params.location.as_ref() {
-            Some(AgentConversationResumeLocation::Choose { cwd: Some(cwd), .. }) => cwd.as_str(),
+        let cwd = match (cwd_override.as_deref(), params.location.as_ref()) {
+            (Some(cwd), _) => cwd,
+            (None, Some(AgentConversationResumeLocation::Choose { cwd: Some(cwd), .. })) => {
+                cwd.as_str()
+            }
             _ => record.saved_location.cwd.as_str(),
         };
         let cwd = match validated_resume_cwd(cwd) {
             Ok(cwd) => cwd,
             Err(message) => {
-                return resume_response(id, "location_required", &record, Some(&message))
+                return resume_response(
+                    id,
+                    if restore {
+                        "cwd_required"
+                    } else {
+                        "location_required"
+                    },
+                    &record,
+                    Some(&message),
+                )
             }
         };
-        let destination = match resolve_resume_destination(
-            &self.state.workspaces,
-            &record.saved_location.workspace_location_id,
-            &record.saved_location.tab_location_id,
-            params.location.as_ref(),
-        ) {
+        let resolved = if restore && params.location.is_none() {
+            resolve_restore_destination(
+                &self.state.workspaces,
+                &self.state.terminals,
+                &record.saved_location,
+            )
+        } else {
+            resolve_resume_destination(
+                &self.state.workspaces,
+                &record.saved_location.workspace_location_id,
+                &record.saved_location.tab_location_id,
+                params.location.as_ref(),
+            )
+        };
+        let destination = match resolved {
             Ok(destination) => destination,
             Err(message) => {
                 return resume_response(id, "location_required", &record, Some(&message))
@@ -441,8 +712,42 @@ impl super::App {
             Err(error) => return encode_error(id, "conversation_resume_failed", error.to_string()),
         };
         self.sync_agent_inbox_deadline();
-        match self.launch_conversation_resume(destination, cwd, &plan) {
+        match self.launch_conversation_resume(destination, cwd, &plan, restore) {
             Ok((workspace, tab, pane_id)) => {
+                if restore {
+                    if let Some(label) = &record.saved_location.pane_label {
+                        let terminal_id = &self.state.workspaces[workspace].tabs[tab].panes
+                            [&pane_id]
+                            .attached_terminal_id;
+                        if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+                            terminal.set_manual_label(label.clone());
+                        }
+                    }
+                    if matches!(destination, ResumeDestination::NewSpace) {
+                        if !record.saved_location.workspace_label.trim().is_empty() {
+                            self.state.workspaces[workspace]
+                                .set_custom_name(record.saved_location.workspace_label.clone());
+                        }
+                        if params.location.is_none()
+                            && !record.saved_location.workspace_location_id.is_empty()
+                        {
+                            self.state.workspaces[workspace].location_id =
+                                record.saved_location.workspace_location_id.clone();
+                        }
+                    }
+                    if !matches!(destination, ResumeDestination::Tab { .. }) {
+                        if !record.saved_location.tab_label.trim().is_empty() {
+                            self.state.workspaces[workspace].tabs[tab]
+                                .set_custom_name(record.saved_location.tab_label.clone());
+                        }
+                        if params.location.is_none()
+                            && !record.saved_location.tab_location_id.is_empty()
+                        {
+                            self.state.workspaces[workspace].tabs[tab].location_id =
+                                record.saved_location.tab_location_id.clone();
+                        }
+                    }
+                }
                 let ws = &self.state.workspaces[workspace];
                 let tab_label = ws.tab_display_name(tab).unwrap_or_default();
                 let tab = &ws.tabs[tab];
@@ -458,6 +763,15 @@ impl super::App {
                     workspace_label: ws.display_name_from_terminals(&self.state.terminals),
                     tab_label,
                     tab_id: crate::workspace::public_tab_id_for_number(&ws.id, tab.number),
+                    pane_label: self.state.terminals[&tab.panes[&pane_id].attached_terminal_id]
+                        .manual_label
+                        .clone(),
+                    pane_number: tab
+                        .layout
+                        .pane_ids()
+                        .iter()
+                        .position(|id| *id == pane_id)
+                        .map(|index| index + 1),
                     workspace_location_id: ws.location_id.clone(),
                     tab_location_id: tab.location_id.clone(),
                     cwd: self.state.terminals[&tab.panes[&pane_id].attached_terminal_id]
@@ -465,12 +779,17 @@ impl super::App {
                         .to_string_lossy()
                         .into_owned(),
                 };
+                let pane_id = restore
+                    .then(|| self.focus_conversation_attachment(&target))
+                    .flatten();
                 match self.agent_inbox.mutate(
                     &record.id,
                     pending.revision,
                     ConversationAction::ResumeLaunched(Box::new(target)),
                     super::inbox::now_ms(),
                 ) {
+                    Ok(record) if restore => restore_response(id, "pending", &record,
+                        Some("Awaiting native session confirmation. Continue in the restored terminal."), pane_id),
                     Ok(record) => resume_response(
                         id,
                         "pending",
@@ -483,7 +802,11 @@ impl super::App {
                     ),
                     Err(error) => {
                         self.agent_inbox_error = Some(error.to_string());
-                        resume_response(id, "uncertain", &pending, Some("The process started, but its launch target could not be saved. Do not retry until the existing process is reconciled."))
+                        if restore {
+                            restore_response(id, "uncertain", &pending, Some("The process started, but its launch target could not be saved. Do not retry until the existing process is reconciled."), pane_id)
+                        } else {
+                            resume_response(id, "uncertain", &pending, Some("The process started, but its launch target could not be saved. Do not retry until the existing process is reconciled."))
+                        }
                     }
                 }
             }
@@ -503,6 +826,21 @@ impl super::App {
     }
 }
 
+fn restore_response(
+    id: String,
+    status: &str,
+    record: &crate::agent_inbox::ConversationRecord,
+    message: Option<&str>,
+    pane_id: Option<String>,
+) -> String {
+    super::api::responses::encode_success(
+        id,
+        crate::api::schema::ResponseResult::AgentConversationResume {
+            result: serde_json::json!({"status": status, "conversation": record, "message": message, "pane_id": pane_id}),
+        },
+    )
+}
+
 fn resume_response(
     id: String,
     status: &str,
@@ -520,6 +858,273 @@ fn resume_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_uses_unique_human_names_after_stable_location_ids_are_lost() {
+        let mut workspace = Workspace::test_new("Saved Space");
+        workspace.tabs[0].set_custom_name("Saved tab".into());
+        let saved = saved_registry().records().remove(0).saved_location;
+        assert_ne!(workspace.location_id, saved.workspace_location_id);
+        assert_ne!(workspace.tabs[0].location_id, saved.tab_location_id);
+        assert_eq!(
+            resolve_restore_destination(&[workspace], &Default::default(), &saved).unwrap(),
+            ResumeDestination::Tab {
+                workspace: 0,
+                tab: 0
+            }
+        );
+    }
+
+    #[test]
+    fn restore_reuses_unique_displayed_numeric_tab_name_after_id_migration() {
+        let mut saved = saved_registry().records().remove(0).saved_location;
+        saved.tab_label = "1".into();
+        let workspace = Workspace::test_new("Saved Space");
+        assert_eq!(
+            resolve_restore_destination(&[workspace], &Default::default(), &saved).unwrap(),
+            ResumeDestination::Tab {
+                workspace: 0,
+                tab: 0
+            }
+        );
+    }
+
+    #[test]
+    fn restore_creates_only_the_missing_container_and_refuses_duplicate_names() {
+        let saved = saved_registry().records().remove(0).saved_location;
+        let workspace = Workspace::test_new("Saved Space");
+        assert_eq!(
+            resolve_restore_destination(&[workspace], &Default::default(), &saved).unwrap(),
+            ResumeDestination::NewTab { workspace: 0 }
+        );
+        assert_eq!(
+            resolve_restore_destination(&[], &Default::default(), &saved).unwrap(),
+            ResumeDestination::NewSpace
+        );
+        let first = Workspace::test_new("Saved Space");
+        let second = Workspace::test_new("Saved Space");
+        assert!(
+            resolve_restore_destination(&[first, second], &Default::default(), &saved).is_err()
+        );
+        let mut workspace = Workspace::test_new("Saved Space");
+        workspace.tabs[0].set_custom_name("Saved tab".into());
+        workspace.test_add_tab(Some("Saved tab"));
+        assert!(resolve_restore_destination(&[workspace], &Default::default(), &saved).is_err());
+    }
+
+    #[test]
+    fn restore_prefers_durable_tab_identity_after_move_and_rejects_duplicate_durable_ids() {
+        let mut saved = saved_registry().records().remove(0).saved_location;
+        let mut workspace = Workspace::test_new("Moved destination");
+        workspace.tabs[0].location_id = saved.tab_location_id.clone();
+        assert_eq!(
+            resolve_restore_destination(&[workspace], &Default::default(), &saved).unwrap(),
+            ResumeDestination::Tab {
+                workspace: 0,
+                tab: 0
+            }
+        );
+        let first = Workspace::test_new("one");
+        let mut second = Workspace::test_new("two");
+        second.location_id = first.location_id.clone();
+        saved.workspace_location_id = first.location_id.clone();
+        assert!(
+            resolve_restore_destination(&[first, second], &Default::default(), &saved).is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_launch_focuses_the_new_exact_pane_in_the_existing_tab() {
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            super::super::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state
+            .workspaces
+            .push(Workspace::test_new("Saved Space"));
+        app.state.workspaces[0].tabs[0].set_custom_name("Saved tab".into());
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        let original = app.state.workspaces[0].tabs[0].root_pane;
+        let saved = saved_registry().records().remove(0).saved_location;
+        let destination =
+            resolve_restore_destination(&app.state.workspaces, &app.state.terminals, &saved)
+                .unwrap();
+        let plan = crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            dedupe_key: "isolated-restore-test".into(),
+        };
+        let (workspace, tab, pane) = app
+            .launch_conversation_resume(destination, std::env::temp_dir(), &plan, true)
+            .unwrap();
+        assert_eq!((workspace, tab), (0, 0));
+        assert_ne!(pane, original);
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(pane));
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Codex),
+            crate::detect::AgentState::Idle,
+        );
+        terminal
+            .set_agent_session_ref(
+                "herdr:codex".into(),
+                "codex".into(),
+                crate::agent_resume::AgentSessionRef::id("existing-live-test"),
+                Some(1),
+            )
+            .unwrap();
+        app.sync_agent_conversations();
+        let record = app.agent_inbox.records().remove(0);
+        let record = app
+            .agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                crate::agent_inbox::ConversationAction::Settle,
+                super::super::inbox::now_ms(),
+            )
+            .unwrap();
+        app.state.active = Some(1);
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_agent_conversation_restore(
+                "existing".into(),
+                crate::api::schema::AgentConversationRestoreParams {
+                    conversation_id: record.id,
+                    expected_revision: record.revision,
+                    location: None,
+                    cwd: None,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            response["result"]["result"]["status"], "confirmed",
+            "{response}"
+        );
+        assert_eq!(
+            response["result"]["result"]["pane_id"],
+            app.public_pane_id(0, pane).unwrap()
+        );
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(pane));
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].panes.len(),
+            2,
+            "reusing the live native attachment must not launch another pane"
+        );
+        let mut missing_tab = saved.clone();
+        missing_tab.tab_label = "Missing saved tab".into();
+        missing_tab.tab_location_id = "deleted-tab".into();
+        let destination =
+            resolve_restore_destination(&app.state.workspaces, &app.state.terminals, &missing_tab)
+                .unwrap();
+        assert_eq!(destination, ResumeDestination::NewTab { workspace: 0 });
+        let (workspace, tab, pane) = app
+            .launch_conversation_resume(destination, std::env::temp_dir(), &plan, true)
+            .unwrap();
+        assert_eq!((workspace, tab), (0, 1));
+        assert_eq!(
+            app.state.workspaces.len(),
+            2,
+            "a missing tab must reuse the existing Space"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(pane));
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[test]
+    fn restore_pending_target_focuses_without_manufacturing_native_confirmation() {
+        use crate::agent_inbox::{ConversationAction, ResumeState};
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            super::super::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.agent_inbox = saved_registry();
+        let record = app.agent_inbox.records().remove(0);
+        let record = app
+            .agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                ConversationAction::SettleAndClose,
+                2,
+            )
+            .unwrap();
+        let pending = app
+            .agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                ConversationAction::BeginResume,
+                super::super::inbox::now_ms(),
+            )
+            .unwrap();
+        app.state
+            .workspaces
+            .push(Workspace::test_new("reserved target"));
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let mut target = record.saved_location.clone();
+        target.terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .to_string();
+        target.public_pane_id = app.public_pane_id(0, pane).unwrap();
+        let pending = app
+            .agent_inbox
+            .mutate(
+                &pending.id,
+                pending.revision,
+                ConversationAction::ResumeLaunched(Box::new(target.clone())),
+                super::super::inbox::now_ms(),
+            )
+            .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_agent_conversation_restore(
+                "pending".into(),
+                crate::api::schema::AgentConversationRestoreParams {
+                    conversation_id: pending.id.clone(),
+                    expected_revision: pending.revision,
+                    location: None,
+                    cwd: None,
+                },
+            ))
+            .unwrap();
+        assert_eq!(response["result"]["result"]["status"], "pending");
+        assert_eq!(
+            response["result"]["result"]["pane_id"],
+            target.public_pane_id
+        );
+        assert_eq!(app.state.active, Some(0));
+        let after = app.agent_inbox.get(&pending.id).unwrap();
+        assert_eq!(after.resume_state, ResumeState::Pending);
+        assert_eq!(after.session_ref, record.session_ref);
+        assert!(after.attachments.is_empty());
+        assert!(app
+            .state
+            .terminals
+            .values()
+            .all(|terminal| terminal.provider_reported_session().is_none()));
+    }
 
     #[test]
     fn saved_location_never_falls_back_to_current_or_reused_public_ids() {
@@ -605,6 +1210,8 @@ mod tests {
                         workspace_label: "Saved Space".into(),
                         tab_label: "Saved tab".into(),
                         tab_id: "w1:t1".into(),
+                        pane_label: None,
+                        pane_number: Some(1),
                         workspace_location_id: "space".into(),
                         tab_location_id: "tab".into(),
                         cwd: "/".into(),
@@ -770,7 +1377,12 @@ mod tests {
             dedupe_key: "test".into(),
         };
         let (workspace, tab, pane) = app
-            .launch_conversation_resume(ResumeDestination::NewSpace, std::env::temp_dir(), &plan)
+            .launch_conversation_resume(
+                ResumeDestination::NewSpace,
+                std::env::temp_dir(),
+                &plan,
+                false,
+            )
             .unwrap();
         let terminal_id = app.state.workspaces[workspace].tabs[tab].panes[&pane]
             .attached_terminal_id
@@ -943,6 +1555,98 @@ mod tests {
             &crate::agent_resume::AgentSessionRef::id("native-session").unwrap()
         )
         .is_ok());
+    }
+
+    #[test]
+    fn restore_distinguishes_missing_directory_and_accepts_independent_cwd_override() {
+        use crate::agent_inbox::{ConversationAction, ConversationObservation, ExecutionState};
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            super::super::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.agent_inbox = saved_registry();
+        let record = app.agent_inbox.records().remove(0);
+        let mut attachment = record.saved_location;
+        attachment.cwd = "/herdr-does-not-exist/resume".into();
+        app.agent_inbox
+            .reconcile(
+                &[ConversationObservation {
+                    provider: record.provider,
+                    source: record.source,
+                    session_ref: record.session_ref,
+                    generation: attachment.terminal_id.clone(),
+                    attachment,
+                    title: record.title,
+                    execution: ExecutionState::Idle,
+                    queued_human_work: false,
+                    blocking_request: false,
+                    failure: false,
+                    capability_limits: Vec::new(),
+                }],
+                2,
+            )
+            .unwrap();
+        let record = app.agent_inbox.records().remove(0);
+        let record = app
+            .agent_inbox
+            .mutate(
+                &record.id,
+                record.revision,
+                ConversationAction::SettleAndClose,
+                3,
+            )
+            .unwrap();
+        let params = crate::api::schema::AgentConversationRestoreParams {
+            conversation_id: record.id.clone(),
+            expected_revision: record.revision,
+            location: None,
+            cwd: None,
+        };
+        let response: serde_json::Value = serde_json::from_str(
+            &app.handle_agent_conversation_restore("directory".into(), params.clone()),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["result"]["status"], "cwd_required");
+        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        let legacy: serde_json::Value =
+            serde_json::from_str(&app.handle_agent_conversation_resume(
+                "legacy".into(),
+                crate::api::schema::AgentConversationResumeParams {
+                    conversation_id: record.id,
+                    expected_revision: record.revision,
+                    location: None,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            legacy["result"]["result"]["status"], "location_required",
+            "legacy Resume keeps its published result semantics"
+        );
+        app.state
+            .workspaces
+            .push(Workspace::test_new("Saved Space"));
+        app.state
+            .workspaces
+            .push(Workspace::test_new("Saved Space"));
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_agent_conversation_restore(
+                "destination".into(),
+                crate::api::schema::AgentConversationRestoreParams {
+                    cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+                    ..params
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            response["result"]["result"]["status"], "location_required",
+            "valid cwd override proceeds to destination resolution"
+        );
+        assert_eq!(app.terminal_runtimes.len(), 0);
     }
 
     #[test]

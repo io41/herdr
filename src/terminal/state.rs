@@ -147,6 +147,7 @@ pub struct TerminalState {
     managed_agent: Option<ManagedAgent>,
     codex_prompt_ready: bool,
     managed_agent_launch_session: Option<crate::agent_resume::PersistedAgentSession>,
+    native_resume_launch_pending: Option<(Agent, Instant)>,
     hook_report_sequences: HashMap<String, u64>,
     suppressed_full_lifecycle_hook_reports: HashMap<String, SuppressedFullLifecycleHookReport>,
     stale_full_lifecycle_hook_sessions: HashMap<String, Vec<StaleFullLifecycleHookSession>>,
@@ -188,6 +189,7 @@ impl TerminalState {
             managed_agent: None,
             codex_prompt_ready: false,
             managed_agent_launch_session: None,
+            native_resume_launch_pending: None,
             hook_report_sequences: HashMap::new(),
             suppressed_full_lifecycle_hook_reports: HashMap::new(),
             stale_full_lifecycle_hook_sessions: HashMap::new(),
@@ -387,6 +389,9 @@ impl TerminalState {
             && !newer_custom_authority
             && (previous_agent_label.is_some() || self.agent_name.is_some());
         if self.should_ignore_detected_state_under_full_lifecycle_hook(agent, process_exited) {
+            if !process_exited {
+                self.observe_native_resume_process(agent, now);
+            }
             if self
                 .hook_authority
                 .as_ref()
@@ -427,6 +432,7 @@ impl TerminalState {
                 agent_released: false,
             };
         }
+        self.observe_native_resume_process(agent, now);
         self.detected_agent = agent;
         if process_exited || agent != Some(Agent::Codex) || fallback_state == AgentState::Blocked {
             self.codex_prompt_ready = false;
@@ -796,6 +802,11 @@ impl TerminalState {
                     );
                 }
             }
+        }
+        if reported_session_ref.as_ref().is_some_and(|reported| {
+            self.native_resume_identity_matches(&source, &agent_label, reported, now)
+        }) {
+            self.cancel_native_resume_launch();
         }
         self.persisted_agent_session = None;
         self.provider_reported_session = reported_session_ref
@@ -1702,6 +1713,14 @@ impl TerminalState {
             agent: agent_label,
             session_ref,
         };
+        if self.native_resume_identity_matches(
+            &persisted_session.source,
+            &persisted_session.agent,
+            &persisted_session.session_ref,
+            now,
+        ) {
+            self.cancel_native_resume_launch();
+        }
         if self.managed_agent_launch_session.as_ref() == Some(&persisted_session) {
             self.managed_agent_launch_session = None;
         }
@@ -2192,16 +2211,60 @@ impl TerminalState {
         });
     }
 
+    pub(crate) fn begin_native_resume_launch(&mut self, expected_agent: Agent) {
+        self.native_resume_launch_pending = Some((expected_agent, Instant::now()));
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub(crate) fn cancel_native_resume_launch(&mut self) {
+        if self.native_resume_launch_pending.take().is_some() {
+            self.revision = self.revision.saturating_add(1);
+        }
+    }
+
+    fn observe_native_resume_process(&mut self, agent: Option<Agent>, observed_at: Instant) {
+        if self
+            .native_resume_launch_pending
+            .is_some_and(|(expected, started_at)| {
+                agent == Some(expected) && observed_at > started_at
+            })
+        {
+            self.cancel_native_resume_launch();
+        }
+    }
+
+    fn native_resume_identity_matches(
+        &self,
+        source: &str,
+        agent: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+        observed_at: Instant,
+    ) -> bool {
+        self.native_resume_launch_pending
+            .is_some_and(|(expected, started_at)| {
+                crate::detect::parse_agent_label(agent) == Some(expected)
+                    && observed_at >= started_at
+            })
+            && self.persisted_agent_session.as_ref().is_some_and(|saved| {
+                saved.source == source && saved.agent == agent && &saved.session_ref == session_ref
+            })
+    }
+
     pub fn managed_agent_launch_pending(&self) -> bool {
-        self.managed_agent.is_some_and(|managed| {
-            matches!(
-                managed.phase,
-                ManagedAgentPhase::Pending { .. } | ManagedAgentPhase::Blocked
-            )
-        })
+        self.pending_agent_resume_plan.is_some()
+            || self.native_resume_launch_pending.is_some()
+            || self.managed_agent.is_some_and(|managed| {
+                matches!(
+                    managed.phase,
+                    ManagedAgentPhase::Pending { .. } | ManagedAgentPhase::Blocked
+                )
+            })
     }
 
     pub fn managed_agent_interactive_ready(&self) -> bool {
+        if self.native_resume_launch_pending.is_some() || self.pending_agent_resume_plan.is_some() {
+            return false;
+        }
         self.managed_agent
             .is_some_and(|managed| matches!(managed.phase, ManagedAgentPhase::Active))
     }
@@ -2359,6 +2422,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.cancel_native_resume_launch();
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -2514,6 +2578,114 @@ mod tests {
             agent: agent_label.into(),
             session_ref,
         });
+    }
+
+    #[test]
+    fn native_resume_startup_waits_for_fresh_expected_process_even_with_saved_idle_state() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        let stale = Instant::now();
+        terminal.begin_native_resume_launch(Agent::Codex);
+        assert!(terminal.managed_agent_launch_pending());
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            stale,
+        );
+        assert!(
+            terminal.managed_agent_launch_pending(),
+            "queued pre-launch Idle cannot prove acquisition"
+        );
+        let same_tick = terminal.native_resume_launch_pending.unwrap().1;
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            same_tick,
+        );
+        assert!(
+            terminal.managed_agent_launch_pending(),
+            "equal clock timestamps cannot prove post-launch acquisition"
+        );
+        terminal.set_detected_state(None, AgentState::Unknown);
+        assert!(
+            terminal.managed_agent_launch_pending(),
+            "the shell before native startup is transitional"
+        );
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        assert!(
+            terminal.managed_agent_launch_pending(),
+            "another provider is not the expected process"
+        );
+        let fresh = terminal.native_resume_launch_pending.unwrap().1 + Duration::from_millis(1);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            fresh,
+        );
+        assert!(!terminal.managed_agent_launch_pending());
+        assert!(
+            terminal.agent_name.is_none(),
+            "native startup does not invent a managed name"
+        );
+        terminal.begin_native_resume_launch(Agent::Codex);
+        let fresh = terminal.native_resume_launch_pending.unwrap().1 + Duration::from_millis(1);
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Codex),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            false,
+            fresh,
+        );
+        assert!(
+            !terminal.managed_agent_launch_pending(),
+            "fresh acquisition clears even when the effective Idle state stays the same"
+        );
+        terminal.begin_native_resume_launch(Agent::Codex);
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert!(!terminal.managed_agent_launch_pending());
+    }
+
+    #[test]
+    fn accepted_exact_native_identity_can_confirm_resume_startup_without_a_user_turn() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("restored-native").unwrap(),
+        });
+        terminal.begin_native_resume_launch(Agent::Codex);
+        terminal
+            .set_agent_session_ref(
+                "herdr:codex".into(),
+                "codex".into(),
+                crate::agent_resume::AgentSessionRef::id("restored-native"),
+                Some(1),
+            )
+            .unwrap();
+        assert!(!terminal.managed_agent_launch_pending());
+        assert_eq!(
+            terminal
+                .provider_reported_session()
+                .unwrap()
+                .session_ref
+                .value,
+            "restored-native"
+        );
     }
 
     #[test]

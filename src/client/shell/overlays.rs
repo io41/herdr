@@ -240,7 +240,9 @@ pub(crate) fn render_context_menu(
         }
         let row = Rect::new(inner.x, row_y, inner.width, 1);
         let highlighted = index == menu.highlighted;
-        let style = if highlighted {
+        let style = if item.action == ClientContextMenuAction::Disabled {
+            Style::default().fg(palette.overlay0).bg(palette.panel_bg)
+        } else if highlighted {
             Style::default()
                 .fg(panel_contrast_fg(palette))
                 .bg(palette.accent)

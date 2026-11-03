@@ -47,3 +47,27 @@ Final validation uses the repository-pinned Rust 1.96.1 and Zig 0.16.0 in a temp
 An isolated actual TUI check also passes: Inbox, Working, Settled, and a closed conversation received through the optional server companion render in the client. The test client and server are stopped. Artifacts remain under `/private/tmp/herdr-inbox-tui-1793626200/`.
 
 Detailed command output remains under `/private/tmp/herdr-toolchain/`. The real-provider acceptance artifacts are under `/private/tmp/herdr-inbox-resume-turn-1793625829/`. The local decision trail is `.local/prd/agent-inbox/decisions.tsv` and remains outside the tracked change.
+
+
+## November 3 UX and safe-close validation
+
+The sidebar now uses meaningful titles and saved Space, tab, and pane breadcrumbs. The view selector replaces the stale flat/grouped header. The UI uses the new advertised `agent.conversation.settle_and_close` and `agent.conversation.restore` methods; legacy method semantics and generation-1 fixtures remain unchanged.
+
+Settle checkpoints the tagged layout, persists the closed conversation and retired terminal generations, then closes its exact eligible pane. Restore reuses durable IDs or unique displayed names, creates only missing containers, and focuses the resulting pane. Raw input, actual delivery, native startup, revisions, duplicate attachments, and uncertain identity guard destructive close. Snapshot pruning preserves unrelated screen history and refuses invalid provenance.
+
+Validation uses pinned Rust 1.96.1 and Zig 0.16.0:
+
+- Final affected-path run: 741 passed. The final narrow-row and keyboard run: 36 passed. Final snapshot/input run: 46 passed. Unix actor run: 25 passed. These runs overlap and must not be summed as unique tests.
+- `just lint` passes. Generated API schema check passes after regeneration. Frozen endpoint fixtures and `skills/herdr/SKILL.md` are unchanged.
+- Full native run: 3,993 passed, 62 failed, 15 skipped. Of the 62 failures, 61 are also present in the saved baseline. One runner could not execute its test binary. A concurrent rebuild is the suspected cause; the complete 46-test snapshot/input rerun passes. The saved baseline uses a different compiler, so this is not a controlled before/after comparison. The full suite is not green.
+- UI hot-path architecture: 6 passed. Authorized integration asset and documentation contract checks pass. Maintenance: 168 passed and 10 release-test setup errors because `/var/tmp` is not writable by this user. Release workflows: 4 passed and one `/var/tmp` setup failure. Windows lint cannot run without the Windows SDK. No system directory permissions or SDK license state were changed.
+- Credential-free API fixture `/private/tmp/herdr-toolchain/ux-placement-smoke.py` passes automatic Space/tab reuse, new-pane focus, duplicate prevention, and preserving pending startup and an unrelated shell.
+- Real TUI fixture `/private/tmp/herdr-toolchain/ux-tui-smoke.py` passes. ANSI replay in `/private/tmp/huit-51gji4gg/` verifies the saved conversation, compact breadcrumb, clean header, and both keyboard view-selector labels.
+- Fixed 120x40 debug renderer: one pane 631,405 ns/frame; fifteen panes 836,436 ns/frame, 1.32x. This measures within-run scaling, not a controlled comparison with earlier measurements.
+- A fresh live Codex round trip remains unverified because startup requires folder trust. A proposed temporary-home test that copied credentials was rejected by automatic approval review and was not executed. The replacement fixtures use no copied credentials.
+
+Normal gruvbox settings, custom bindings, widgets, Palette, pane movement, Latch, and all five plugins are staged in the isolated inbox profile. `herdr-inbox config check` passes, and the actual plugin list reports all five enabled. The original inbox profile is backed up privately. The running user server has not been reloaded or restarted; plugin startup behavior needs the user's restart. The launcher pins configuration, cache, state, and binary paths without editing `.zshrc`.
+
+Automatic settlement on Codex exit and automatic reopening on manual resume remain deferred. Codex 0.166's documented SessionEnd reason is `other`, and SessionStart cannot establish manual intent. Snooze and pins remain outside this delivery.
+
+Independent GPT-6.1-Sol high review found and reproduced an acknowledgement-ordering defect. Actual writer delivery receipts and delayed-receiver regressions address it. The follow-up safety review found no supported data-loss issue. A separate prose review checked the fork guide.

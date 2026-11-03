@@ -478,12 +478,16 @@ pub(super) fn navigator_rows(
                 } else {
                     crate::api::schema::AgentStatus::Idle
                 };
+                let title = super::agent_inbox::conversation_title(record);
+                let breadcrumb = super::agent_inbox::conversation_breadcrumb(record);
+                let unavailable = stale || !super::agent_inbox::cache_current(endpoint);
                 if !filter(status)
                     || !(endpoint_query_matches
                         || text(&format!(
-                            "{} {} {} {} {}",
-                            record.title,
+                            "{} {} {} {} {} {}",
+                            title,
                             record.provider,
+                            breadcrumb,
                             record.saved_location.cwd,
                             record.saved_location.workspace_id,
                             record.saved_location.tab_id
@@ -493,17 +497,16 @@ pub(super) fn navigator_rows(
                 }
                 endpoint_rows.push(ClientNavigatorRow {
                     depth: u8::from(federated),
-                    label: record.title.clone(),
+                    label: title,
                     meta: format!(
-                        "{} · {} · {:?}",
-                        record.provider,
-                        super::agent_inbox::record_status(record, stale),
-                        record.disposition
+                        "{} · {}",
+                        super::agent_inbox::record_status(record, unavailable),
+                        record.provider
                     ),
-                    detail: record.saved_location.cwd.clone(),
+                    detail: breadcrumb,
                     agent: Some(record.provider.clone()),
                     status: Some(status),
-                    stale: stale || !super::agent_inbox::cache_current(endpoint),
+                    stale: unavailable,
                     current: endpoint.endpoint_id == *active_endpoint_id
                         && endpoint.snapshot.as_deref().is_some_and(|snapshot| {
                             record.attachments.iter().any(|attachment| {

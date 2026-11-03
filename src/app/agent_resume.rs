@@ -295,9 +295,34 @@ impl App {
             }
         };
 
+        let native_resume_agent = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+            .and_then(|session| {
+                crate::agent_resume::plan(&session.source, &session.agent, &session.session_ref)
+            })
+            .filter(|native| native.argv == plan.argv && native.agent == plan.agent)
+            .and_then(|native| crate::detect::parse_agent_label(&native.agent));
+        if let Some(agent) = native_resume_agent {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.begin_native_resume_launch(agent);
+            }
+        }
         let mut input = resume_command;
         input.push('\r');
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(input)) {
+        let submitted = if native_resume_agent.is_some() {
+            runtime.try_send_system_bytes(Bytes::from(input))
+        } else {
+            runtime.try_send_bytes(Bytes::from(input))
+        };
+        if let Err(err) = submitted {
+            if native_resume_agent.is_some() {
+                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                    terminal.cancel_native_resume_launch();
+                }
+            }
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,

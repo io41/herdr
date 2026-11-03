@@ -176,6 +176,8 @@ mod tests {
             "agent.rename",
             "agent.conversation.open",
             "agent.conversation.settle",
+            "agent.conversation.settle_and_close",
+            "agent.conversation.restore",
             "agent.conversation.reopen",
             "agent.conversation.resume",
             "agent.view.set",

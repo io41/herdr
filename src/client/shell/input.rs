@@ -711,6 +711,14 @@ impl ClientShellState {
                 }
                 self.mode = return_mode;
                 outcome.repaint = true;
+                if crate::config::terminal_key_matches_combo(
+                    key,
+                    (KeyCode::Char('a'), KeyModifiers::SHIFT),
+                ) {
+                    self.open_selected_conversation_actions(outcome);
+                } else if key.code == KeyCode::Char('i') && key.modifiers.is_empty() {
+                    self.open_agent_view_selector(outcome);
+                }
                 None
             }
             ClientShellMode::Navigate => {
